@@ -312,7 +312,7 @@ class ProfileRowWidget:
 
 # --- Worker thread for master-slave test ---
 class MasterSlaveWorkerThread(threading.Thread):
-    def __init__(self, settings: Settings, csv_folder: Optional[str], rotate_hours: float,
+    def __init__(self, settings:  Settings, csv_folder: Optional[str], rotate_hours: float,
                  record_interval_s: int, log_queue: queue.Queue, plot_queue: Optional[queue.Queue] = None):
         super().__init__(daemon=True)
         self.settings = settings
@@ -322,13 +322,20 @@ class MasterSlaveWorkerThread(threading.Thread):
         self.log_queue = log_queue
         self.plot_queue = plot_queue
         self._stop = threading.Event()
-        self.master = InstrumentController(settings.master_port, settings.baud_rate, self._log, "MASTER")
+        self.master = InstrumentController(settings. master_port, settings.baud_rate, self._log, "MASTER")
         self.slave = InstrumentController(settings.slave_port, settings.baud_rate, self._log, "SLAVE")
         self.csv_file = None
-        self.csv_writer = None
-        self.current_csv_start = None
+        self. csv_writer = None
+        self. current_csv_start = None
         self.test_start_time = None
         self. csv_lock = threading.Lock()
+        
+        # Energy/Capacity tracking
+        self.cumulative_energy_wh = 0.0  # Watt-hours
+        self.cumulative_capacity_ah = 0.0  # Ampere-hours
+        self.last_measurement_time = None
+        self.last_total_power = 0.0
+        self.last_total_current = 0.0
 
     def _now_central(self) -> datetime: 
         if CHI_TZ is not None:
@@ -354,7 +361,7 @@ class MasterSlaveWorkerThread(threading.Thread):
             return
         os.makedirs(self.csv_folder, exist_ok=True)
         start = self._now_central()
-        fname = start.strftime("master_slave_load_%Y%m%d_%H%M%S_central.csv")
+        fname = start. strftime("master_slave_load_%Y%m%d_%H%M%S_central.csv")
         path = os.path.join(self.csv_folder, fname)
         f = open(path, "w", newline="", encoding="utf-8")
         writer = csv.writer(f)
@@ -369,12 +376,17 @@ class MasterSlaveWorkerThread(threading.Thread):
             "slave_voltage_v",
             "slave_current_a",
             "slave_power_w",
+            "total_power_w",
+            "total_current_a",
+            "avg_voltage_v",
             "power_imbalance_%",
             "current_imbalance_%",
-            "voltage_imbalance_%"
+            "voltage_imbalance_%",
+            "cumulative_energy_wh",
+            "cumulative_capacity_ah"
         ])
         self.csv_file = f
-        self. csv_writer = writer
+        self.csv_writer = writer
         self.current_csv_start = start
         self._log(f"Opened CSV:  {path}")
 
@@ -404,7 +416,8 @@ class MasterSlaveWorkerThread(threading.Thread):
             self._open_new_csv()
 
     def _write_csv_row(self, step_idx: int, total_set_power:  float, mv, mi, mp, sv, si, sp, 
-                       power_imb, current_imb, voltage_imb):
+                       power_imb, current_imb, voltage_imb, total_power, total_current, avg_voltage,
+                       cumulative_energy_wh, cumulative_capacity_ah):
         if not self.csv_writer:
             return
         ts = self._format_ts(self._now_central())
@@ -418,22 +431,49 @@ class MasterSlaveWorkerThread(threading.Thread):
             "" if sv is None else f"{sv:.6g}",
             "" if si is None else f"{si:.6g}",
             "" if sp is None else f"{sp:.6g}",
-            f"{power_imb:.3f}",
+            f"{total_power:.6g}",
+            f"{total_current:.6g}",
+            f"{avg_voltage:.6g}",
+            f"{power_imb:. 3f}",
             f"{current_imb:.3f}",
-            f"{voltage_imb:.3f}"
+            f"{voltage_imb:.3f}",
+            f"{cumulative_energy_wh:.6f}",
+            f"{cumulative_capacity_ah:.6f}"
         ]
         try:
             with self.csv_lock:
                 self.csv_writer.writerow(row)
                 self.csv_file.flush()
         except Exception as e:
-            self._log(f"[ERROR] Writing CSV row:  {e}")
+            self._log(f"[ERROR] Writing CSV row: {e}")
 
-    def _push_plot_point(self, step_idx: int, mv, mi, mp, sv, si, sp):
+    def _push_plot_point(self, step_idx: int, mv, mi, mp, sv, si, sp, 
+                        cumulative_energy_wh, cumulative_capacity_ah):
         if self.plot_queue is None:
             return
         rel = int((self._now_central() - self.test_start_time).total_seconds())
-        self.plot_queue.put((rel, step_idx, mv, mi, mp, sv, si, sp))
+        self.plot_queue.put((rel, step_idx, mv, mi, mp, sv, si, sp, 
+                            cumulative_energy_wh, cumulative_capacity_ah))
+
+    def _calculate_energy_increment(self, current_power, current_current, delta_time_hours):
+        """
+        Calculate energy increment using trapezoidal rule
+        Args:
+            current_power: Current total power in Watts
+            current_current: Current total current in Amperes  
+            delta_time_hours:  Time interval in hours
+        Returns:
+            energy_wh: Energy in Watt-hours
+            capacity_ah: Capacity in Ampere-hours
+        """
+        # Trapezoidal integration:  (P1 + P2)/2 * dt
+        avg_power = (self.last_total_power + current_power) / 2.0
+        avg_current = (self.last_total_current + current_current) / 2.0
+        
+        energy_wh = avg_power * delta_time_hours
+        capacity_ah = avg_current * delta_time_hours
+        
+        return energy_wh, capacity_ah
 
     def _safe_shutdown(self, reason: Optional[str] = None):
         self._log("⚠ Shutting down loads...")
@@ -537,6 +577,7 @@ class MasterSlaveWorkerThread(threading.Thread):
                 if row.cutoff:
                     # Run until cutoff
                     while not self._stop.is_set():
+                        # Get measurements
                         mv = self.master.read_voltage()
                         mi = self.master.read_current()
                         mp = self.master.read_power()
@@ -544,6 +585,52 @@ class MasterSlaveWorkerThread(threading.Thread):
                         si = self.slave.read_current()
                         sp = self.slave. read_power()
 
+                        # Calculate totals
+                        total_power = 0.0
+                        total_current = 0.0
+                        avg_voltage = 0.0
+                        
+                        if mp is not None and sp is not None:
+                            total_power = mp + sp
+                        elif mp is not None:
+                            total_power = mp
+                        elif sp is not None:
+                            total_power = sp
+                        
+                        if mi is not None and si is not None:
+                            total_current = mi + si
+                        elif mi is not None:
+                            total_current = mi
+                        elif si is not None:
+                            total_current = si
+                        
+                        if mv is not None and sv is not None:
+                            avg_voltage = (mv + sv) / 2.0
+                        elif mv is not None:
+                            avg_voltage = mv
+                        elif sv is not None:
+                            avg_voltage = sv
+
+                        # Calculate cumulative energy and capacity
+                        current_time = time.time()
+                        if self.last_measurement_time is not None:
+                            delta_time_seconds = current_time - self.last_measurement_time
+                            delta_time_hours = delta_time_seconds / 3600.0
+                            
+                            energy_increment, capacity_increment = self._calculate_energy_increment(
+                                total_power, total_current, delta_time_hours
+                            )
+                            
+                            self.cumulative_energy_wh += energy_increment
+                            self.cumulative_capacity_ah += capacity_increment
+                        
+                        self.last_measurement_time = current_time
+                        self.last_total_power = total_power
+                        self.last_total_current = total_current
+
+                        self._log(f"  M: V={mv}V I={mi}A P={mp}W | S: V={sv}V I={si}A P={sp}W | "
+                                 f"Total:  {total_power:.2f}W, {total_current:.2f}A | "
+                                 f"Energy: {self.cumulative_energy_wh:.3f}Wh, Cap: {self.cumulative_capacity_ah:.3f}Ah")
                         self._log(f"  M: V={mv}V I={mi}A P={mp}W | S:  V={sv}V I={si}A P={sp}W")
 
                         # Check transition phase
@@ -593,9 +680,12 @@ class MasterSlaveWorkerThread(threading.Thread):
                         if self.csv_writer:
                             self._maybe_rotate_csv()
                             self._write_csv_row(idx, total_power, mv, mi, mp, sv, si, sp, 
-                                              power_imb, current_imb, voltage_imb)
+                                              power_imb, current_imb, voltage_imb,
+                                              total_power, total_current, avg_voltage,
+                                              self.cumulative_energy_wh, self.cumulative_capacity_ah)
 
-                        self._push_plot_point(idx, mv, mi, mp, sv, si, sp)
+                        self._push_plot_point(idx, mv, mi, mp, sv, si, sp,
+                                            self.cumulative_energy_wh, self. cumulative_capacity_ah)
 
                         for _ in range(max(1, int(self.record_interval_s))):
                             if self._stop.is_set():
@@ -776,23 +866,33 @@ class App(tk.Tk):
         self.email_receiver_var = tk.StringVar(value="")
         self.email_password_var = tk.StringVar(value="")
 
-        # Plot data arrays
-        self.plot_times: List[float] = []
-        self.plot_master_voltage: List[float] = []
-        self.plot_master_current: List[float] = []
-        self.plot_master_power: List[float] = []
-        self.plot_slave_voltage: List[float] = []
-        self.plot_slave_current: List[float] = []
-        self.plot_slave_power: List[float] = []
+        # Plot data arrays (totals only)
+        self.plot_times:  List[float] = []
+        self.plot_total_power: List[float] = []
+        self.plot_total_current: List[float] = []
+        self.plot_avg_voltage: List[float] = []
+        self.plot_cumulative_energy:  List[float] = []  # NEW
+        self.plot_cumulative_capacity: List[float] = []  # NEW
+
+        # Style controls for each line
+        self.power_color_var = tk.StringVar(value="blue")
+        self.power_width_var = tk. DoubleVar(value=2.0)
+        self.power_style_var = tk.StringVar(value="solid")
+        
+        self.current_color_var = tk.StringVar(value="red")
+        self.current_width_var = tk.DoubleVar(value=2.0)
+        self.current_style_var = tk.StringVar(value="solid")
+        
+        self.voltage_color_var = tk.StringVar(value="green")
+        self.voltage_width_var = tk.DoubleVar(value=2.0)
+        self.voltage_style_var = tk.StringVar(value="solid")
+        
+        self.energy_color_var = tk.StringVar(value="purple")  # NEW
+        self.energy_width_var = tk.DoubleVar(value=2.0)  # NEW
+        self. energy_style_var = tk. StringVar(value="solid")  # NEW
 
         # Status
         self.status_top_lines = deque(maxlen=20)
-
-        # Style controls
-        self.master_color_var = tk.StringVar(value="blue")
-        self.slave_color_var = tk.StringVar(value="red")
-        self.line_width_var = tk.DoubleVar(value=1.2)
-        self.line_style_var = tk.StringVar(value="solid")
 
         # Config note
         self.config_note_fontsize = tk.IntVar(value=14)
@@ -972,128 +1072,268 @@ class App(tk.Tk):
         plot_control_frame = ttk.Frame(plot_tab)
         plot_control_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
         
-        ttk.Label(plot_control_frame, text="Master-Slave Real-Time Monitoring", 
+        ttk.Label(plot_control_frame, text="Master-Slave Combined Real-Time Monitoring", 
                   font=('Arial', 14, 'bold')).pack(side=tk.LEFT, padx=10)
         
-        ttk.Button(plot_control_frame, text="Clear Plots", 
+        ttk.Button(plot_control_frame, text="Clear Plot", 
                    command=self._clear_plots).pack(side=tk.RIGHT, padx=5)
         ttk.Button(plot_control_frame, text="Export Plot Image", 
                    command=self._save_plot_screenshot).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(plot_control_frame, text="Export Plot Data (CSV)", 
+        ttk.Button(plot_control_frame, text="Export Plot Data ()", 
                    command=self._export_plot_data).pack(side=tk.RIGHT, padx=5)
         
         # Main plot area
         plot_main_frame = ttk.Frame(plot_tab)
         plot_main_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=6)
-    
-        self.fig = Figure(figsize=(12, 8), dpi=100)
-        self.ax_power = self.fig.add_subplot(311)
-        self.ax_current = self.fig.add_subplot(312)
-        self.ax_voltage = self.fig.add_subplot(313)
-    
-        self.ax_power.set_ylabel("Power (W)", fontsize=10, fontweight='bold')
-        self.ax_current.set_ylabel("Current (A)", fontsize=10, fontweight='bold')
-        self.ax_voltage.set_ylabel("Voltage (V)", fontsize=10, fontweight='bold')
-        self.ax_voltage.set_xlabel("Time (s)", fontsize=10, fontweight='bold')
-    
-        for ax in [self.ax_power, self.ax_current, self. ax_voltage]:
-            ax. grid(True, alpha=0.3)
-    
-        (self.line_master_power,) = self.ax_power.plot([], [], color="blue", linestyle="-", linewidth=1.5, label="Master", marker='o', markersize=3)
-        (self.line_slave_power,) = self.ax_power.plot([], [], color="red", linestyle="-", linewidth=1.5, label="Slave", marker='s', markersize=3)
-        self.ax_power.legend(loc='upper right', fontsize=9)
-    
-        (self.line_master_current,) = self.ax_current.plot([], [], color="blue", linestyle="-", linewidth=1.5, label="Master", marker='o', markersize=3)
-        (self.line_slave_current,) = self.ax_current.plot([], [], color="red", linestyle="-", linewidth=1.5, label="Slave", marker='s', markersize=3)
-        self.ax_current. legend(loc='upper right', fontsize=9)
-    
-        (self.line_master_voltage,) = self.ax_voltage.plot([], [], color="blue", linestyle="-", linewidth=1.5, label="Master", marker='o', markersize=3)
-        (self.line_slave_voltage,) = self.ax_voltage.plot([], [], color="red", linestyle="-", linewidth=1.5, label="Slave", marker='s', markersize=3)
-        self.ax_voltage.legend(loc='upper right', fontsize=9)
-    
+
+        # Create single plot with multiple y-axes
+        self. fig = Figure(figsize=(12, 7), dpi=100)
+        self.ax_power = self.fig.add_subplot(111)
+        
+        # Create secondary y-axes
+        self.ax_current = self.ax_power.twinx()
+        self.ax_voltage = self.ax_power.twinx()
+        self.ax_energy = self.ax_power.twinx()  # NEW:  Fourth y-axis for energy
+        
+        # Offset the right spines
+        self.ax_voltage.spines['right'].set_position(('outward', 60))
+        self.ax_energy.spines['right'].set_position(('outward', 120))  # NEW
+        
+        # Labels
+        self.ax_power. set_xlabel("Time (s)", fontsize=11, fontweight='bold')
+        self.ax_power.set_ylabel("Total Power (W)", fontsize=11, fontweight='bold', 
+                                  color=self.power_color_var.get())
+        self.ax_current.set_ylabel("Total Current (A)", fontsize=11, fontweight='bold', 
+                                    color=self.current_color_var.get())
+        self.ax_voltage.set_ylabel("Avg Voltage (V)", fontsize=11, fontweight='bold', 
+                                    color=self. voltage_color_var.get())
+        self.ax_energy. set_ylabel("Energy (Wh) / Capacity (Ah)", fontsize=11, fontweight='bold',  # NEW
+                                   color=self.energy_color_var.get())
+        
+        # Tick colors
+        self.ax_power. tick_params(axis='y', labelcolor=self.power_color_var.get())
+        self.ax_current.tick_params(axis='y', labelcolor=self.current_color_var.get())
+        self.ax_voltage.tick_params(axis='y', labelcolor=self.voltage_color_var.get())
+        self.ax_energy.tick_params(axis='y', labelcolor=self.energy_color_var.get())  # NEW
+        
+        # Grid
+        self.ax_power. grid(True, alpha=0.3, linestyle='--')
+        
+        # Create line objects
+        (self.line_power,) = self.ax_power.plot([], [], 
+                                                 color=self. power_color_var.get(), 
+                                                 linestyle=LINE_STYLES[self.power_style_var.get()], 
+                                                 linewidth=self.power_width_var.get(),
+                                                 marker='o', markersize=4,
+                                                 label="Total Power (W)")
+        
+        (self.line_current,) = self.ax_current.plot([], [], 
+                                                     color=self.current_color_var.get(), 
+                                                     linestyle=LINE_STYLES[self.current_style_var.get()], 
+                                                     linewidth=self. current_width_var.get(),
+                                                     marker='s', markersize=4,
+                                                     label="Total Current (A)")
+        
+        (self.line_voltage,) = self.ax_voltage.plot([], [], 
+                                                     color=self.voltage_color_var.get(), 
+                                                     linestyle=LINE_STYLES[self.voltage_style_var.get()], 
+                                                     linewidth=self. voltage_width_var.get(),
+                                                     marker='^', markersize=4,
+                                                     label="Avg Voltage (V)")
+        
+        # NEW: Energy line (Wh)
+        (self.line_energy,) = self.ax_energy.plot([], [], 
+                                                   color=self.energy_color_var.get(), 
+                                                   linestyle=LINE_STYLES[self.energy_style_var.get()], 
+                                                   linewidth=self.energy_width_var.get(),
+                                                   marker='d', markersize=4,
+                                                   label="Energy (Wh)")
+        
+        # Combined legend
+        lines = [self.line_power, self.line_current, self. line_voltage, self.line_energy]  # Added energy
+        labels = [l.get_label() for l in lines]
+        self.ax_power.legend(lines, labels, loc='upper left', fontsize=9, framealpha=0.9)
+        
         self.fig.tight_layout()
-    
+
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_main_frame)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-    
+
         toolbar_mpl = NavigationToolbar2Tk(self.canvas, plot_main_frame)
         toolbar_mpl.update()
         toolbar_mpl.pack(side=tk. BOTTOM, fill=tk.X)
-    
+
         # Right panel for plot styles
         plot_right_panel = ttk.Frame(plot_tab)
         plot_right_panel.pack(side=tk. RIGHT, fill=tk.Y, padx=8, pady=6)
-    
-        style_fr = ttk. Labelframe(plot_right_panel, text="Plot Appearance", padding=(8, 8))
-        style_fr.pack(side=tk.TOP, fill=tk.X)
-    
-        ttk.Label(style_fr, text="Master Color:", font=('Arial', 9, 'bold')).pack(pady=(5, 2))
-        self.master_color_display = tk.Canvas(style_fr, width=80, height=25, bg=self.master_color_var.get(), relief=tk.RIDGE, borderwidth=2)
-        self.master_color_display.pack(pady=2)
-        ttk.Button(style_fr, text="Change Master Color", command=lambda: self._choose_color(self.master_color_var)).pack(pady=2)
-        
-        ttk. Separator(style_fr, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
-        
-        ttk.Label(style_fr, text="Slave Color:", font=('Arial', 9, 'bold')).pack(pady=(5, 2))
-        self.slave_color_display = tk.Canvas(style_fr, width=80, height=25, bg=self.slave_color_var.get(), relief=tk.RIDGE, borderwidth=2)
-        self.slave_color_display.pack(pady=2)
-        ttk.Button(style_fr, text="Change Slave Color", command=lambda:  self._choose_color(self. slave_color_var)).pack(pady=2)
-    
-        ttk.Separator(style_fr, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
-    
-        ttk.Label(style_fr, text="Line Width: ").pack(pady=2)
-        ttk.Scale(style_fr, from_=0.5, to=5.0, variable=self.line_width_var, 
-                  orient=tk.HORIZONTAL, command=lambda _: self._apply_line_styles()).pack(pady=2, fill=tk.X, padx=5)
-        
-        ttk.Button(style_fr, text="Apply Styles", command=self._apply_line_styles, 
-                   style='Accent.TButton').pack(pady=10, fill=tk.X)
-    
-        # Statistics panel
-        stats_fr = ttk.Labelframe(plot_right_panel, text="Current Statistics", padding=(8, 8))
-        stats_fr.pack(side=tk.TOP, fill=tk. BOTH, expand=True, pady=(10, 0))
-    
-        ttk.Label(stats_fr, text="Data Points:", font=('Arial', 9, 'bold')).pack(anchor='w', pady=2)
-        self.stats_points_label = ttk.Label(stats_fr, text="0")
-        self.stats_points_label.pack(anchor='w', padx=10)
-    
-        ttk.Label(stats_fr, text="Elapsed Time:", font=('Arial', 9, 'bold')).pack(anchor='w', pady=2)
-        self.stats_time_label = ttk.Label(stats_fr, text="0 s")
-        self.stats_time_label.pack(anchor='w', padx=10)
-    
-        ttk.Label(stats_fr, text="Master Avg Power:", font=('Arial', 9, 'bold')).pack(anchor='w', pady=2)
-        self.stats_master_avg_label = ttk.Label(stats_fr, text="0.0 W")
-        self.stats_master_avg_label. pack(anchor='w', padx=10)
-    
-        ttk.Label(stats_fr, text="Slave Avg Power:", font=('Arial', 9, 'bold')).pack(anchor='w', pady=2)
-        self.stats_slave_avg_label = ttk.Label(stats_fr, text="0.0 W")
-        self.stats_slave_avg_label.pack(anchor='w', padx=10)
-    
-        # Bottom control buttons
-        bottom_fr = ttk.Frame(self)
-        bottom_fr.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 8))
-        ttk.Button(bottom_fr, text="Clear Log", command=self._clear_log).pack(side=tk.LEFT, padx=5)
-        ttk.Button(bottom_fr, text="Export Log", command=self._export_log).pack(side=tk.LEFT, padx=5)
-        ttk.Button(bottom_fr, text="Quit", command=self._on_quit).pack(side=tk.RIGHT, padx=5)
-    
-        self._update_config_note()
-        self._apply_line_styles()
 
+        # Create scrollable frame for styles
+        style_canvas = tk.Canvas(plot_right_panel, width=200)
+        style_scrollbar = ttk.Scrollbar(plot_right_panel, orient="vertical", command=style_canvas. yview)
+        style_scrollable_frame = ttk.Frame(style_canvas)
+        
+        style_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: style_canvas.configure(scrollregion=style_canvas.bbox("all"))
+        )
+        
+        style_canvas.create_window((0, 0), window=style_scrollable_frame, anchor="nw")
+        style_canvas.configure(yscrollcommand=style_scrollbar. set)
+        
+        style_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        style_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        style_fr = ttk. Labelframe(style_scrollable_frame, text="Line Appearance", padding=(10, 10))
+        style_fr.pack(fill=tk. BOTH, expand=True, padx=5, pady=5)
+
+        # [Keep all existing Power, Current, Voltage controls as before]
+        # Power line controls
+        ttk.Label(style_fr, text="━━━ Total Power ━━━", 
+                  font=('Arial', 10, 'bold')).pack(pady=(5, 10))
+        
+        ttk. Label(style_fr, text="Color: ").pack(anchor='w', padx=5)
+        self.power_color_display = tk.Canvas(style_fr, width=100, height=30, 
+                                              bg=self.power_color_var. get(), 
+                                              relief=tk.RIDGE, borderwidth=2)
+        self.power_color_display.pack(pady=3)
+        ttk.Button(style_fr, text="Choose Color", 
+                   command=lambda: self._choose_line_color(self.power_color_var, 
+                                                           self.power_color_display)).pack(pady=3)
+        
+        ttk.Label(style_fr, text="Width:").pack(anchor='w', padx=5, pady=(5, 0))
+        ttk.Scale(style_fr, from_=0.5, to=5.0, variable=self.power_width_var, 
+                  orient=tk.HORIZONTAL).pack(fill=tk.X, padx=5, pady=3)
+        
+        ttk.Label(style_fr, text="Style:").pack(anchor='w', padx=5, pady=(5, 0))
+        power_style_combo = ttk.Combobox(style_fr, textvariable=self.power_style_var, 
+                                         values=list(LINE_STYLES.keys()), state='readonly', width=15)
+        power_style_combo.pack(pady=3)
+        
+        ttk. Separator(style_fr, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        
+        # Current line controls
+        ttk.Label(style_fr, text="━━━ Total Current ━━━", 
+                  font=('Arial', 10, 'bold')).pack(pady=(5, 10))
+        
+        ttk.Label(style_fr, text="Color:").pack(anchor='w', padx=5)
+        self.current_color_display = tk.Canvas(style_fr, width=100, height=30, 
+                                                bg=self.current_color_var.get(), 
+                                                relief=tk.RIDGE, borderwidth=2)
+        self.current_color_display.pack(pady=3)
+        ttk.Button(style_fr, text="Choose Color", 
+                   command=lambda: self._choose_line_color(self.current_color_var, 
+                                                           self.current_color_display)).pack(pady=3)
+        
+        ttk. Label(style_fr, text="Width:").pack(anchor='w', padx=5, pady=(5, 0))
+        ttk.Scale(style_fr, from_=0.5, to=5.0, variable=self.current_width_var, 
+                  orient=tk. HORIZONTAL).pack(fill=tk.X, padx=5, pady=3)
+        
+        ttk.Label(style_fr, text="Style:").pack(anchor='w', padx=5, pady=(5, 0))
+        current_style_combo = ttk. Combobox(style_fr, textvariable=self. current_style_var, 
+                                           values=list(LINE_STYLES.keys()), state='readonly', width=15)
+        current_style_combo.pack(pady=3)
+        
+        ttk.Separator(style_fr, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        
+        # Voltage line controls
+        ttk.Label(style_fr, text="━━━ Avg Voltage ━━━", 
+                  font=('Arial', 10, 'bold')).pack(pady=(5, 10))
+        
+        ttk. Label(style_fr, text="Color:").pack(anchor='w', padx=5)
+        self.voltage_color_display = tk.Canvas(style_fr, width=100, height=30, 
+                                                bg=self.voltage_color_var.get(), 
+                                                relief=tk.RIDGE, borderwidth=2)
+        self.voltage_color_display.pack(pady=3)
+        ttk.Button(style_fr, text="Choose Color", 
+                   command=lambda: self._choose_line_color(self.voltage_color_var, 
+                                                           self.voltage_color_display)).pack(pady=3)
+        
+        ttk. Label(style_fr, text="Width:").pack(anchor='w', padx=5, pady=(5, 0))
+        ttk.Scale(style_fr, from_=0.5, to=5.0, variable=self.voltage_width_var, 
+                  orient=tk. HORIZONTAL).pack(fill=tk.X, padx=5, pady=3)
+        
+        ttk.Label(style_fr, text="Style:").pack(anchor='w', padx=5, pady=(5, 0))
+        voltage_style_combo = ttk.Combobox(style_fr, textvariable=self.voltage_style_var, 
+                                           values=list(LINE_STYLES.keys()), state='readonly', width=15)
+        voltage_style_combo.pack(pady=3)
+        
+        ttk.Separator(style_fr, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        
+        # NEW: Energy line controls
+        ttk.Label(style_fr, text="━━━ Cumulative Energy ━━━", 
+                  font=('Arial', 10, 'bold')).pack(pady=(5, 10))
+        
+        ttk. Label(style_fr, text="Color:").pack(anchor='w', padx=5)
+        self.energy_color_display = tk.Canvas(style_fr, width=100, height=30, 
+                                               bg=self.energy_color_var.get(), 
+                                               relief=tk.RIDGE, borderwidth=2)
+        self.energy_color_display.pack(pady=3)
+        ttk.Button(style_fr, text="Choose Color", 
+                   command=lambda: self._choose_line_color(self.energy_color_var, 
+                                                           self.energy_color_display)).pack(pady=3)
+        
+        ttk. Label(style_fr, text="Width:").pack(anchor='w', padx=5, pady=(5, 0))
+        ttk.Scale(style_fr, from_=0.5, to=5.0, variable=self.energy_width_var, 
+                  orient=tk. HORIZONTAL).pack(fill=tk.X, padx=5, pady=3)
+        
+        ttk.Label(style_fr, text="Style:").pack(anchor='w', padx=5, pady=(5, 0))
+        energy_style_combo = ttk.Combobox(style_fr, textvariable=self.energy_style_var, 
+                                          values=list(LINE_STYLES.keys()), state='readonly', width=15)
+        energy_style_combo.pack(pady=3)
+        
+        ttk.Separator(style_fr, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=15)
+        
+        ttk.Button(style_fr, text="Apply All Styles", command=self._apply_line_styles).pack(pady=10, fill=tk.X, padx=10)
+
+        # Statistics panel
+        stats_fr = ttk. Labelframe(plot_right_panel, text="Statistics", padding=(10, 10))
+        stats_fr.pack(side=tk. BOTTOM, fill=tk.X, pady=(10, 0))
+
+        ttk.Label(stats_fr, text="Data Points:", font=('Arial', 9, 'bold')).grid(row=0, column=0, sticky='w', pady=2)
+        self.stats_points_label = ttk.Label(stats_fr, text="0")
+        self.stats_points_label.grid(row=0, column=1, sticky='e', pady=2)
+
+        ttk.Label(stats_fr, text="Elapsed Time:", font=('Arial', 9, 'bold')).grid(row=1, column=0, sticky='w', pady=2)
+        self.stats_time_label = ttk.Label(stats_fr, text="0 s")
+        self.stats_time_label.grid(row=1, column=1, sticky='e', pady=2)
+
+        ttk.Label(stats_fr, text="Avg Total Power:", font=('Arial', 9, 'bold')).grid(row=2, column=0, sticky='w', pady=2)
+        self.stats_avg_power_label = ttk. Label(stats_fr, text="0.0 W")
+        self.stats_avg_power_label. grid(row=2, column=1, sticky='e', pady=2)
+
+        ttk.Label(stats_fr, text="Avg Total Current:", font=('Arial', 9, 'bold')).grid(row=3, column=0, sticky='w', pady=2)
+        self.stats_avg_current_label = ttk.Label(stats_fr, text="0.0 A")
+        self.stats_avg_current_label.grid(row=3, column=1, sticky='e', pady=2)
+
+        ttk.Label(stats_fr, text="Avg Voltage:", font=('Arial', 9, 'bold')).grid(row=4, column=0, sticky='w', pady=2)
+        self.stats_avg_voltage_label = ttk. Label(stats_fr, text="0.0 V")
+        self.stats_avg_voltage_label.grid(row=4, column=1, sticky='e', pady=2)
+
+        # NEW: Energy statistics
+        ttk. Separator(stats_fr, orient=tk.HORIZONTAL).grid(row=5, column=0, columnspan=2, sticky='ew', pady=5)
+        
+        ttk.Label(stats_fr, text="Total Energy:", font=('Arial', 9, 'bold')).grid(row=6, column=0, sticky='w', pady=2)
+        self.stats_energy_label = ttk.Label(stats_fr, text="0.0 Wh", foreground='purple')
+        self.stats_energy_label.grid(row=6, column=1, sticky='e', pady=2)
+
+        ttk.Label(stats_fr, text="Total Capacity:", font=('Arial', 9, 'bold')).grid(row=7, column=0, sticky='w', pady=2)
+        self.stats_capacity_label = ttk.Label(stats_fr, text="0.0 Ah", foreground='purple')
+        self.stats_capacity_label. grid(row=7, column=1, sticky='e', pady=2)
     
     def _clear_plots(self):
         """Clear all plot data"""
         self.plot_times.clear()
-        self.plot_master_voltage.clear()
-        self.plot_master_current.clear()
-        self.plot_master_power.clear()
-        self.plot_slave_voltage.clear()
-        self.plot_slave_current.clear()
-        self.plot_slave_power.clear()
+        self.plot_total_power.clear()
+        self.plot_total_current.clear()
+        self.plot_avg_voltage.clear()
+        self.plot_cumulative_energy.clear()  # NEW
+        self.plot_cumulative_capacity.clear()  # NEW
         self._update_plot_lines(redraw=True)
         self._log("Plots cleared")
 
     def _export_plot_data(self):
-        """Export plot data to CSV"""
+        """Export combined plot data to """
         if not self.plot_times:
             messagebox.showwarning("No Data", "No plot data to export")
             return
@@ -1101,89 +1341,141 @@ class App(tk.Tk):
         path = filedialog.asksaveasfilename(
             title="Export Plot Data",
             defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialfile=f"plot_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            filetypes=[("CSV files", "*. csv"), ("All files", "*.*")],
+            initialfile=f"combined_plot_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         )
         
-        if not path: 
+        if not path:
             return
         
         try:
             with open(path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Time_s', 'Master_Voltage_V', 'Master_Current_A', 'Master_Power_W',
-                               'Slave_Voltage_V', 'Slave_Current_A', 'Slave_Power_W'])
+                writer.writerow(['Time_s', 'Total_Power_W', 'Total_Current_A', 'Avg_Voltage_V',
+                               'Cumulative_Energy_Wh', 'Cumulative_Capacity_Ah'])  # NEW columns
                 
                 for i in range(len(self.plot_times)):
                     writer.writerow([
                         self.plot_times[i],
-                        self.plot_master_voltage[i],
-                        self.plot_master_current[i],
-                        self.plot_master_power[i],
-                        self.plot_slave_voltage[i],
-                        self.plot_slave_current[i],
-                        self.plot_slave_power[i]
+                        self.plot_total_power[i],
+                        self.plot_total_current[i],
+                        self.plot_avg_voltage[i],
+                        self.plot_cumulative_energy[i],  # NEW
+                        self.plot_cumulative_capacity[i]  # NEW
                     ])
             
             messagebox.showinfo("Success", f"Plot data exported to:\n{path}")
-            self._log(f"Plot data exported:  {path}")
+            self._log(f"Combined plot data exported:  {path}")
         except Exception as e:
             messagebox.showerror("Export Error", str(e))
             self._log(f"[ERROR] Export failed: {e}")
 
     # Profile row helpers
-    def _append_row_widget(self, row_model:  ProfileRow):
-        idx = len(self.row_widgets)
-        widget = ProfileRowWidget(self. rows_container, idx, row_model, on_delete=self._delete_row, on_move_up=self._move_up, on_move_down=self._move_down)
-        widget.grid(row_idx=idx + 1)
-        self.row_widgets. append(widget)
-        self._refresh_row_indices()
-
     def _add_row(self):
+        """Add a new row"""
+        # First, save current values from existing widgets
+        self._sync_profile_from_widgets()
+        
+        # Add new row
         new_row = ProfileRow(total_power=100.0, duration_value=1, duration_unit="hours", cutoff=False)
         self.settings.profile.append(new_row)
         self._append_row_widget(new_row)
+        self._log("Added new profile row")
 
     def _delete_row(self, index):
+        """Delete a row"""
         if 0 <= index < len(self.row_widgets):
-            widget = self.row_widgets.pop(index)
-            widget.destroy()
-            self. settings.profile.pop(index)
+            # Save current values first
+            self._sync_profile_from_widgets()
+            
+            # Remove from both GUI and data
+            widget = self.row_widgets. pop(index)
+            widget. destroy()
+            self.settings.profile.pop(index)
+            
+            # Rebuild to fix indices
             self._rebuild_row_widgets()
             self._log(f"Deleted row {index + 1}")
 
     def _move_up(self, index):
+        """Move row up"""
         if index <= 0 or index >= len(self.row_widgets):
             return
-        self.settings.profile[index - 1], self.settings.profile[index] = self.settings.profile[index], self.settings.profile[index - 1]
+        
+        # Save current values first
+        self._sync_profile_from_widgets()
+        
+        # Swap in profile
+        self.settings.profile[index - 1], self.settings.profile[index] = \
+            self.settings.profile[index], self.settings.profile[index - 1]
+        
+        # Rebuild widgets
         self._rebuild_row_widgets()
+        self._log(f"Moved row {index + 1} up")
 
     def _move_down(self, index):
+        """Move row down"""
         if index < 0 or index >= len(self.row_widgets) - 1:
             return
-        self.settings.profile[index], self.settings.profile[index + 1] = self.settings. profile[index + 1], self.settings.profile[index]
+        
+        # Save current values first
+        self._sync_profile_from_widgets()
+        
+        # Swap in profile
+        self.settings.profile[index], self.settings.profile[index + 1] = \
+            self. settings.profile[index + 1], self.settings.profile[index]
+        
+        # Rebuild widgets
         self._rebuild_row_widgets()
+        self._log(f"Moved row {index + 1} down")
 
     def _clear_all_rows(self):
+        """Clear all rows"""
         if not messagebox.askyesno("Clear all", "Remove all profile rows?"):
             return
         for w in self.row_widgets:
             w.destroy()
         self.row_widgets.clear()
-        self. settings.profile.clear()
+        self.settings.profile.clear()
         self._log("Cleared all profile rows.")
 
     def _rebuild_row_widgets(self):
-        for w in self.row_widgets:
-            w.destroy()
+        """Rebuild all row widgets from profile data"""
+        # Destroy all existing widgets
+        for w in self. row_widgets:
+            w. destroy()
         self.row_widgets = []
+        
+        # Recreate from profile data
         for model in self.settings.profile:
             self._append_row_widget(model)
 
+    def _sync_profile_from_widgets(self):
+        """Sync profile data from current widget values"""
+        for i, widget in enumerate(self.row_widgets):
+            if i < len(self.settings. profile):
+                self.settings.profile[i] = widget.get_value()
+
     def _refresh_row_indices(self):
+        """Refresh row indices after changes"""
         for i, w in enumerate(self.row_widgets):
             w.update_index(i)
             w.grid(row_idx=i + 1)
+
+    def _append_row_widget(self, row_model:  ProfileRow):
+        """Append a row widget"""
+        idx = len(self.row_widgets)
+        widget = ProfileRowWidget(
+            self.rows_container, 
+            idx, 
+            row_model, 
+            on_delete=self._delete_row, 
+            on_move_up=self._move_up, 
+            on_move_down=self._move_down
+        )
+        widget.grid(row_idx=idx + 1)
+        self.row_widgets.append(widget)
+        self._refresh_row_indices()
 
     # CSV/config helpers
     def _select_csv_folder(self):
@@ -1430,40 +1722,41 @@ class App(tk.Tk):
 
     # Apply settings
     def _apply_settings(self):
+        """Apply settings from GUI"""
         try:
             self.settings.master_port = self.master_port_entry.get().strip() or DEFAULT_MASTER_PORT
             self.settings.slave_port = self.slave_port_entry.get().strip() or DEFAULT_SLAVE_PORT
-            self. settings.baud_rate = int(self.baud_entry. get().strip())
+            self.settings. baud_rate = int(self.baud_entry.get().strip())
             self.settings.dry_run = bool(self.dry_var.get())
-            self.settings.cutoff_voltage = float(self.cutoff_entry. get().strip())
-            self.settings.cutoff_safety_enabled = bool(self.cutoff_safety_var. get())
-            self.settings. imbalance_limit = float(self.imbalance_limit_var.get()) / 100.0
-            self. settings.imbalance_transition = float(self.imbalance_transition_var.get()) / 100.0
+            self.settings.cutoff_voltage = float(self.cutoff_entry.get().strip())
+            self.settings.cutoff_safety_enabled = bool(self.cutoff_safety_var.get())
+            self.settings.imbalance_limit = float(self.imbalance_limit_var.get()) / 100.0
+            self.settings.imbalance_transition = float(self.imbalance_transition_var.get()) / 100.0
             self.settings.transition_duration = int(self.transition_duration_var.get())
             self.settings.voltage_diff_limit = float(self.voltage_diff_limit_var.get()) / 100.0
             
-            self.settings. email_enabled = bool(self.email_enabled_var.get())
+            self.settings.email_enabled = bool(self.email_enabled_var.get())
             self.settings.email_sender = self.email_sender_var.get().strip()
             self.settings. email_receiver = self.email_receiver_var.get().strip()
             self.settings.email_password = self.email_password_var.get().strip()
-
-            new_profile: List[ProfileRow] = []
-            for w in self.row_widgets:
-                pr = w.get_value()
-                new_profile.append(pr)
-            if not new_profile:
+    
+            # Sync profile from widgets
+            self._sync_profile_from_widgets()
+            
+            # Validate profile
+            if not self. settings.profile:
                 raise ValueError("Profile must contain at least one row.")
-            self.settings.profile = new_profile
             
             self._log("Settings applied.")
             self._update_config_note()
             return True
-        except Exception as e: 
-            messagebox.showerror("Error applying settings", str(e))
+        except Exception as e:
+            messagebox. showerror("Error applying settings", str(e))
             raise
 
     # Start/Stop
     def _start(self):
+        """Start the test"""
         if self.worker and self.worker.is_alive():
             messagebox.showwarning("Already running", "Test is in progress.")
             return
@@ -1486,12 +1779,11 @@ class App(tk.Tk):
         
         # Reset plot arrays
         self.plot_times. clear()
-        self.plot_master_voltage.clear()
-        self.plot_master_current.clear()
-        self.plot_master_power.clear()
-        self.plot_slave_voltage.clear()
-        self.plot_slave_current.clear()
-        self.plot_slave_power.clear()
+        self.plot_total_power.clear()
+        self.plot_total_current. clear()
+        self.plot_avg_voltage.clear()
+        self.plot_cumulative_energy.clear()  # NEW
+        self.plot_cumulative_capacity.clear()  # NEW
         self._update_plot_lines(redraw=True)
 
     def _stop(self):
@@ -1524,69 +1816,113 @@ class App(tk.Tk):
 
     # Plot updates
     def _periodic_plot_poll(self):
+        """Poll plot queue and update with combined totals"""
         updated = False
         try:
             while True:
-                rel, step_idx, mv, mi, mp, sv, si, sp = self.plot_queue.get_nowait()
+                rel, step_idx, mv, mi, mp, sv, si, sp, energy_wh, capacity_ah = self. plot_queue.get_nowait()
+                
+                # Calculate totals
+                total_power = 0.0
+                total_current = 0.0
+                avg_voltage = 0.0
+                
+                if mp is not None and sp is not None:
+                    total_power = mp + sp
+                elif mp is not None:
+                    total_power = mp
+                elif sp is not None:
+                    total_power = sp
+                
+                if mi is not None and si is not None:
+                    total_current = mi + si
+                elif mi is not None:
+                    total_current = mi
+                elif si is not None:
+                    total_current = si
+                
+                if mv is not None and sv is not None:
+                    avg_voltage = (mv + sv) / 2.0
+                elif mv is not None:
+                    avg_voltage = mv
+                elif sv is not None: 
+                    avg_voltage = sv
+                
                 self.plot_times.append(rel)
-                self.plot_master_voltage.append(mv if mv is not None else float('nan'))
-                self.plot_master_current.append(mi if mi is not None else float('nan'))
-                self.plot_master_power.append(mp if mp is not None else float('nan'))
-                self.plot_slave_voltage.append(sv if sv is not None else float('nan'))
-                self.plot_slave_current.append(si if si is not None else float('nan'))
-                self.plot_slave_power.append(sp if sp is not None else float('nan'))
+                self.plot_total_power.append(total_power if total_power > 0 else float('nan'))
+                self.plot_total_current.append(total_current if total_current > 0 else float('nan'))
+                self.plot_avg_voltage.append(avg_voltage if avg_voltage > 0 else float('nan'))
+                self.plot_cumulative_energy.append(energy_wh)  # NEW
+                self.plot_cumulative_capacity.append(capacity_ah)  # NEW
+                
                 updated = True
-        except queue. Empty:
+        except queue.Empty:
             pass
 
         if updated:
             self._update_plot_lines()
         self.after(500, self._periodic_plot_poll)
-
+        
     def _update_plot_lines(self, redraw:  bool = False):
+        """Update plot lines with combined data"""
         if not self.plot_times:
             return
         
         x = self.plot_times
         
-        self.line_master_power.set_data(x, self.plot_master_power)
-        self.line_slave_power.set_data(x, self.plot_slave_power)
-        
-        self.line_master_current.set_data(x, self.plot_master_current)
-        self.line_slave_current.set_data(x, self.plot_slave_current)
-        
-        self.line_master_voltage.set_data(x, self.plot_master_voltage)
-        self.line_slave_voltage.set_data(x, self.plot_slave_voltage)
-    
+        # Update line data
+        self.line_power.set_data(x, self.plot_total_power)
+        self.line_current.set_data(x, self.plot_total_current)
+        self.line_voltage.set_data(x, self.plot_avg_voltage)
+        self.line_energy.set_data(x, self.plot_cumulative_energy)  # NEW
+
         x_max = max(x) if x else 10
         
-        for ax in [self.ax_power, self.ax_current, self.ax_voltage]:
-            ax.set_xlim(0, max(10, x_max))
-            try:
-                ax.relim()
-                ax.autoscale_view(True, True, True)
-            except Exception:
-                pass
-    
+        # Update x-axis limits
+        self.ax_power.set_xlim(0, max(10, x_max))
+        
+        # Autoscale y-axes
+        try:
+            self.ax_power.relim()
+            self.ax_power.autoscale_view(True, True, True)
+            self.ax_current.relim()
+            self.ax_current.autoscale_view(True, False, True)
+            self.ax_voltage.relim()
+            self.ax_voltage.autoscale_view(True, False, True)
+            self.ax_energy.relim()  # NEW
+            self.ax_energy.autoscale_view(True, False, True)  # NEW
+        except Exception:
+            pass
+
         # Update statistics
         if hasattr(self, 'stats_points_label'):
             self.stats_points_label.config(text=f"{len(x)}")
             self.stats_time_label. config(text=f"{x_max:.1f} s" if x else "0 s")
             
             # Calculate averages (excluding NaN values)
-            valid_master_power = [p for p in self.plot_master_power if not (p != p)]  # Filter NaN
-            valid_slave_power = [p for p in self. plot_slave_power if not (p != p)]
+            valid_power = [p for p in self. plot_total_power if not (p != p)]
+            valid_current = [c for c in self.plot_total_current if not (c != c)]
+            valid_voltage = [v for v in self.plot_avg_voltage if not (v != v)]
             
-            master_avg = sum(valid_master_power) / len(valid_master_power) if valid_master_power else 0.0
-            slave_avg = sum(valid_slave_power) / len(valid_slave_power) if valid_slave_power else 0.0
+            avg_power = sum(valid_power) / len(valid_power) if valid_power else 0.0
+            avg_current = sum(valid_current) / len(valid_current) if valid_current else 0.0
+            avg_voltage = sum(valid_voltage) / len(valid_voltage) if valid_voltage else 0.0
             
-            self.stats_master_avg_label.config(text=f"{master_avg:.2f} W")
-            self.stats_slave_avg_label. config(text=f"{slave_avg:.2f} W")
-    
+            self.stats_avg_power_label.config(text=f"{avg_power:.2f} W")
+            self.stats_avg_current_label. config(text=f"{avg_current:.2f} A")
+            self.stats_avg_voltage_label.config(text=f"{avg_voltage:.2f} V")
+            
+            # NEW: Update energy statistics (show latest values)
+            if self.plot_cumulative_energy:
+                latest_energy = self.plot_cumulative_energy[-1]
+                latest_capacity = self.plot_cumulative_capacity[-1]
+                self.stats_energy_label.config(text=f"{latest_energy:.4f} Wh")
+                self.stats_capacity_label. config(text=f"{latest_capacity:.4f} Ah")
+
         self.fig.tight_layout()
-    
+
         if redraw:
-            self. canvas.draw_idle()
+            self.canvas.draw_idle()
         else:
             self.canvas.draw()
 
@@ -1603,23 +1939,57 @@ class App(tk.Tk):
             self._apply_line_styles()
     
     def _apply_line_styles(self):
+        """Apply line styles to all plot lines"""
         try:
-            master_color = self.master_color_var.get()
-            slave_color = self.slave_color_var.get()
+            # Update power line
+            power_color = self.power_color_var.get()
+            self.line_power.set_color(power_color)
+            self.line_power.set_linestyle(LINE_STYLES. get(self.power_style_var.get(), "-"))
+            self.line_power.set_linewidth(float(self.power_width_var.get()))
+            self.ax_power.set_ylabel("Total Power (W)", fontsize=11, fontweight='bold', color=power_color)
+            self.ax_power.tick_params(axis='y', labelcolor=power_color)
             
-            self.line_master_power.set_color(master_color)
-            self.line_slave_power.set_color(slave_color)
+            # Update current line
+            current_color = self.current_color_var.get()
+            self.line_current.set_color(current_color)
+            self.line_current.set_linestyle(LINE_STYLES. get(self.current_style_var.get(), "-"))
+            self.line_current.set_linewidth(float(self.current_width_var.get()))
+            self.ax_current.set_ylabel("Total Current (A)", fontsize=11, fontweight='bold', color=current_color)
+            self.ax_current. tick_params(axis='y', labelcolor=current_color)
             
-            self.line_master_current.set_color(master_color)
-            self.line_slave_current.set_color(slave_color)
+            # Update voltage line
+            voltage_color = self.voltage_color_var.get()
+            self.line_voltage.set_color(voltage_color)
+            self.line_voltage.set_linestyle(LINE_STYLES.get(self.voltage_style_var.get(), "-"))
+            self.line_voltage.set_linewidth(float(self. voltage_width_var.get()))
+            self.ax_voltage. set_ylabel("Avg Voltage (V)", fontsize=11, fontweight='bold', color=voltage_color)
+            self.ax_voltage.tick_params(axis='y', labelcolor=voltage_color)
             
-            self.line_master_voltage.set_color(master_color)
-            self.line_slave_voltage.set_color(slave_color)
-
+            # NEW: Update energy line
+            energy_color = self.energy_color_var.get()
+            self.line_energy.set_color(energy_color)
+            self.line_energy.set_linestyle(LINE_STYLES.get(self.energy_style_var. get(), "-"))
+            self.line_energy.set_linewidth(float(self.energy_width_var.get()))
+            self.ax_energy.set_ylabel("Cumulative Energy (Wh)", fontsize=11, fontweight='bold', color=energy_color)
+            self.ax_energy.tick_params(axis='y', labelcolor=energy_color)
+            
+            # Update legend
+            lines = [self.line_power, self. line_current, self.line_voltage, self.line_energy]
+            labels = [l.get_label() for l in lines]
+            self.ax_power.legend(lines, labels, loc='upper left', fontsize=9, framealpha=0.9)
+            
             self._update_plot_lines(redraw=True)
             self._log("Applied plot styles.")
         except Exception as e:
-            self._log(f"[ERROR] Applying styles: {e}")
+            self._log(f"[ERROR] Applying plot styles:  {e}")
+            
+    def _choose_line_color(self, color_var, display_canvas):
+        """Choose color for a specific line"""
+        col = colorchooser.askcolor(title="Choose line color", initialcolor=color_var.get())
+        if col and col[1]:
+            color_var.set(col[1])
+            display_canvas.config(bg=col[1])
+            self._apply_line_styles()
 
     # Config note
     def _get_config_note_text(self) -> str:
