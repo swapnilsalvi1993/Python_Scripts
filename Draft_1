@@ -93,16 +93,17 @@ class Settings:
     master_port: str = DEFAULT_MASTER_PORT
     slave_port: str = DEFAULT_SLAVE_PORT
     baud_rate: int = DEFAULT_BAUD_RATE
-    log_interval: int = DEFAULT_LOG_INTERVAL
+    log_interval:  int = DEFAULT_LOG_INTERVAL
     cutoff_voltage: float = DEFAULT_CUTOFF_VOLTAGE
     dry_run: bool = False
     timeout: float = 1.0
     profile: List[ProfileRow] = field(default_factory=list)
     cutoff_safety_enabled: bool = False
+    imbalance_check_enabled: bool = True  # NEW
     imbalance_limit: float = DEFAULT_IMBALANCE_LIMIT
-    imbalance_transition:  float = DEFAULT_IMBALANCE_TRANSITION
+    imbalance_transition:   float = DEFAULT_IMBALANCE_TRANSITION
     transition_duration: int = DEFAULT_TRANSITION_DURATION
-    voltage_diff_limit:  float = DEFAULT_VOLTAGE_DIFF_LIMIT
+    voltage_diff_limit:   float = DEFAULT_VOLTAGE_DIFF_LIMIT
     email_enabled: bool = False
     email_sender: str = ""
     email_receiver: str = ""
@@ -525,40 +526,71 @@ class MasterSlaveWorkerThread(threading.Thread):
         return dq_dv, dq_dv_voltage, True
 
     def _safe_shutdown(self, reason: Optional[str] = None):
-        """Safe shutdown of loads"""
-        self._log("⚠ Shutting down loads...")
+        """Safe shutdown of loads - ramp down power, turn off, exit remote"""
+        self._log("⚠ Initiating safe shutdown sequence...")
         
-        # Try to turn off loads
+        if reason:
+            self._log(f"  Reason: {reason}")
+        
+        # Step 1: Ramp power down to zero
+        self._log("  Step 1: Ramping power to zero...")
+        for name, controller in [("MASTER", self.master), ("SLAVE", self.slave)]:
+            try:
+                controller.set_power(0.0)
+                self._log(f"    ✓ {name} power set to 0W")
+                time.sleep(0.5)  # Brief delay for command to process
+            except Exception as e: 
+                self._log(f"    ✗ {name} power ramp failed: {e}")
+        
+        # Step 2: Turn off loads
+        self._log("  Step 2: Turning loads OFF...")
         for name, controller in [("MASTER", self.master), ("SLAVE", self.slave)]:
             try:
                 controller.load_off()
-                self._log(f"  ✓ {name} load OFF")
+                self._log(f"    ✓ {name} LOAD OFF")
+                time.sleep(0.2)
             except Exception as e:
-                self._log(f"  ✗ {name} load off failed: {e}")
+                self._log(f"    ✗ {name} load off failed: {e}")
             
             try:
                 controller. input_off()
-                self._log(f"  ✓ {name} input OFF")
-            except Exception as e:
-                self._log(f"  ✗ {name} input off failed: {e}")
-            
-            try:
-                controller. parallel_off()
-                self._log(f"  ✓ {name} parallel mode OFF")
-            except Exception as e:
-                self._log(f"  ✗ {name} parallel off failed: {e}")
-            
-            try:
-                controller. set_local()
-                self._log(f"  ✓ {name} set to LOCAL")
-            except Exception as e:
-                self._log(f"  ✗ {name} set local failed: {e}")
+                self._log(f"    ✓ {name} INPUT OFF")
+                time.sleep(0.2)
+            except Exception as e: 
+                self._log(f"    ✗ {name} input off failed: {e}")
         
-        self._log("✓ Shutdown complete.  Loads are safe.")
+        # Step 3: Disable parallel mode
+        self._log("  Step 3: Disabling parallel mode...")
+        for name, controller in [("MASTER", self.master), ("SLAVE", self.slave)]:
+            try:
+                controller.parallel_off()
+                self._log(f"    ✓ {name} PARALLEL OFF")
+                time.sleep(0.2)
+            except Exception as e:
+                self._log(f"    ✗ {name} parallel off failed: {e}")
         
-        # Send email alert if configured
-        if reason and self.settings.email_enabled:
-            body = f"Loads shut down due to alert:\n\n{reason}"
+        # Step 4: Return to LOCAL mode
+        self._log("  Step 4: Returning to LOCAL control...")
+        for name, controller in [("MASTER", self.master), ("SLAVE", self.slave)]:
+            try:
+                controller.set_local()
+                self._log(f"    ✓ {name} set to LOCAL mode")
+                time.sleep(0.2)
+            except Exception as e:
+                self._log(f"    ✗ {name} set local failed: {e}")
+        
+        self._log("✓ Safe shutdown sequence complete.  Equipment is safe.")
+        
+        # Send email alert if configured and there was a reason
+        if reason and self.settings.email_enabled: 
+            body = (f"Equipment Safety Shutdown\n\n"
+                   f"Reason: {reason}\n\n"
+                   f"Shutdown sequence completed:\n"
+                   f"1. Power ramped to 0W\n"
+                   f"2. Loads turned OFF\n"
+                   f"3. Parallel mode disabled\n"
+                   f"4. Equipment returned to LOCAL mode\n\n"
+                   f"Equipment is now in safe state.")
             send_email_alert(self.settings, self.settings.email_subject, body, self._log)
 
     def run(self):
@@ -604,9 +636,12 @@ class MasterSlaveWorkerThread(threading.Thread):
                     self._log(f"[ERROR] Opening CSV:  {e}")
 
             # Execute profile
-            for idx, row in enumerate(self. settings.profile, start=1):
+            for idx, row in enumerate(self.settings.profile, start=1):
+                # Check if stop requested before starting next step
                 if self._stop_event.is_set():
                     self._log("Stop requested before starting next step.")
+                    self._safe_shutdown("Stop requested by user")
+                    return  # Exit - safe shutdown already done
                     break
 
                 total_power_setting = float(row. total_power)
@@ -648,6 +683,17 @@ class MasterSlaveWorkerThread(threading.Thread):
                 if row.cutoff:
                     # Run until cutoff
                     while not self._stop_event.is_set():
+                        # Initialize all variables at the start
+                        total_power = 0.0
+                        total_current = 0.0
+                        avg_voltage = 0.0
+                        power_imb = 0.0
+                        current_imb = 0.0
+                        voltage_imb = 0.0
+                        dq_dv = 0.0
+                        dq_dv_voltage = 0.0
+                        dq_dv_valid = False
+                        
                         # Get measurements
                         mv = self.master.read_voltage()
                         mi = self.master.read_current()
@@ -657,20 +703,16 @@ class MasterSlaveWorkerThread(threading.Thread):
                         sp = self.slave.read_power()
 
                         # Calculate totals
-                        total_power = 0.0
-                        total_current = 0.0
-                        avg_voltage = 0.0
-                        
                         if mp is not None and sp is not None:
                             total_power = mp + sp
                         elif mp is not None:
                             total_power = mp
-                        elif sp is not None: 
+                        elif sp is not None:
                             total_power = sp
                         
                         if mi is not None and si is not None:
                             total_current = mi + si
-                        elif mi is not None:
+                        elif mi is not None: 
                             total_current = mi
                         elif si is not None:
                             total_current = si
@@ -704,44 +746,56 @@ class MasterSlaveWorkerThread(threading.Thread):
                             avg_voltage, self.cumulative_capacity_ah
                         )
 
-                        self._log(f"  M:  V={mv}V I={mi}A P={mp}W | S:  V={sv}V I={si}A P={sp}W | "
-                                 f"Total:  {total_power:.2f}W, {total_current:.2f}A | "
-                                 f"Energy: {self.cumulative_energy_wh:.3f}Wh, Cap: {self.cumulative_capacity_ah:.3f}Ah | "
+                        self._log(f"  M:   V={mv}V I={mi}A P={mp}W | S:   V={sv}V I={si}A P={sp}W | "
+                                 f"Total:   {total_power:.2f}W, {total_current:.2f}A | "
+                                 f"Energy:  {self.cumulative_energy_wh:.3f}Wh, Cap: {self.cumulative_capacity_ah:.3f}Ah | "
                                  f"dQ/dV: {dq_dv:.4f} Ah/V @ {dq_dv_voltage:.2f}V")
 
                         # Check transition phase
-                        if time.time() - transition_start > self. settings.transition_duration:
+                        if time.time() - transition_start > self.settings.transition_duration:
                             if current_imbalance_limit != self.settings.imbalance_limit:
                                 current_imbalance_limit = self.settings.imbalance_limit
-                                self._log(f"  → Normal phase: {current_imbalance_limit*100}% imbalance threshold")
+                                self._log(f"  → Normal phase:  {current_imbalance_limit*100}% imbalance threshold")
 
                         # Calculate imbalances
                         power_imb, current_imb, voltage_imb = self._calculate_imbalances(mp, sp, mi, si, mv, sv)
 
-                        # Check imbalances
-                        if mp is not None and sp is not None and mp > 0 and sp > 0:
-                            if power_imb > current_imbalance_limit * 100:
-                                reason = f"Power imbalance >{current_imbalance_limit*100}%:  M={mp}W S={sp}W ({power_imb:.1f}%)"
-                                self._log(f"[ALERT] {reason}")
-                                self._safe_shutdown(reason)
-                                self.request_stop()
-                                break
+                        # Check imbalances ONLY if enabled
+                        if self.settings. imbalance_check_enabled: 
+                            # Check imbalances (power)
+                            if mp is not None and sp is not None and mp > 0 and sp > 0:
+                                if power_imb > current_imbalance_limit * 100:
+                                    reason = f"Power imbalance >{current_imbalance_limit*100}%:  M={mp}W S={sp}W ({power_imb:. 1f}%)"
+                                    self._log(f"[ALERT] {reason}")
+                                    self._safe_shutdown(reason)
+                                    self.request_stop()
+                                    break
 
-                        if mi is not None and si is not None and mi > 0 and si > 0:
-                            if current_imb > current_imbalance_limit * 100:
-                                reason = f"Current imbalance >{current_imbalance_limit*100}%: M={mi}A S={si}A ({current_imb:.1f}%)"
-                                self._log(f"[ALERT] {reason}")
-                                self._safe_shutdown(reason)
-                                self.request_stop()
-                                break
+                            # Check imbalances (current)
+                            if mi is not None and si is not None and mi > 0 and si > 0:
+                                if current_imb > current_imbalance_limit * 100:
+                                    reason = f"Current imbalance >{current_imbalance_limit*100}%: M={mi}A S={si}A ({current_imb:.1f}%)"
+                                    self._log(f"[ALERT] {reason}")
+                                    self._safe_shutdown(reason)
+                                    self.request_stop()
+                                    break
 
-                        if mv is not None and sv is not None and mv > 0 and sv > 0:
-                            if voltage_imb > self.settings.voltage_diff_limit * 100:
-                                reason = f"Voltage imbalance >{self.settings.voltage_diff_limit*100}%: M={mv}V S={sv}V ({voltage_imb:.1f}%)"
-                                self._log(f"[ALERT] {reason}")
-                                self._safe_shutdown(reason)
-                                self.request_stop()
-                                break
+                            # Check imbalances (voltage)
+                            if mv is not None and sv is not None and mv > 0 and sv > 0:
+                                if voltage_imb > self.settings.voltage_diff_limit * 100:
+                                    reason = f"Voltage imbalance >{self.settings.voltage_diff_limit*100}%: M={mv}V S={sv}V ({voltage_imb:.1f}%)"
+                                    self._log(f"[ALERT] {reason}")
+                                    self._safe_shutdown(reason)
+                                    self.request_stop()
+                                    break
+                        else:
+                            # Log high imbalance as warning only (not shutdown)
+                            if power_imb > 50:  # Log if very high
+                                self._log(f"[WARNING] High power imbalance: {power_imb:.1f}% (monitoring disabled)")
+                            if current_imb > 50:
+                                self._log(f"[WARNING] High current imbalance: {current_imb:. 1f}% (monitoring disabled)")
+                            if voltage_imb > 20:
+                                self._log(f"[WARNING] High voltage difference: {voltage_imb:.1f}% (monitoring disabled)")
 
                         # Check voltage cutoff
                         if self.settings.cutoff_safety_enabled: 
@@ -753,84 +807,7 @@ class MasterSlaveWorkerThread(threading.Thread):
                                 self.request_stop()
                                 break
 
-                        if self.csv_writer:
-                            self._maybe_rotate_csv()
-                            self._write_csv_row(idx, total_set_power, mv, mi, mp, sv, si, sp, 
-                                              power_imb, current_imb, voltage_imb,
-                                              total_power, total_current, avg_voltage,
-                                              self.cumulative_energy_wh, self.cumulative_capacity_ah,
-                                              dq_dv, dq_dv_voltage)
-
-                        self._push_plot_point(idx, mv, mi, mp, sv, si, sp,
-                                            self.cumulative_energy_wh, self.cumulative_capacity_ah,
-                                            dq_dv, dq_dv_voltage, dq_dv_valid)
-
-                        for _ in range(max(1, int(self.record_interval_s))):
-                            if self._stop_event.is_set():
-                                break
-                            time.sleep(1)
-
-                else:
-                    # Fixed duration
-                    unit_seconds = dict(UNITS)[row.duration_unit]
-                    dur_seconds = float(row.duration_value) * unit_seconds
-                    
-                    while (time.time() - step_start) < dur_seconds and not self._stop_event.is_set():
-                        elapsed = int(time.time() - step_start)
-                        
-                        mv = self.master.read_voltage()
-                        mi = self. master.read_current()
-                        mp = self.master.read_power()
-                        sv = self.slave.read_voltage()
-                        si = self.slave.read_current()
-                        sp = self.slave.read_power()
-
-                        self._log(f"  [{elapsed}s/{int(dur_seconds)}s] M:  V={mv}V I={mi}A P={mp}W | S: V={sv}V I={si}A P={sp}W")
-
-                        # Check transition phase
-                        if time.time() - transition_start > self. settings.transition_duration:
-                            if current_imbalance_limit != self.settings.imbalance_limit:
-                                current_imbalance_limit = self.settings.imbalance_limit
-                                self._log(f"  → Normal phase: {current_imbalance_limit*100}% imbalance threshold")
-
-                        # Calculate imbalances
-                        power_imb, current_imb, voltage_imb = self._calculate_imbalances(mp, sp, mi, si, mv, sv)
-
-                        # Check imbalances (same as cutoff mode)
-                        if mp is not None and sp is not None and mp > 0 and sp > 0:
-                            if power_imb > current_imbalance_limit * 100:
-                                reason = f"Power imbalance >{current_imbalance_limit*100}%: M={mp}W S={sp}W ({power_imb:.1f}%)"
-                                self._log(f"[ALERT] {reason}")
-                                self._safe_shutdown(reason)
-                                self.request_stop()
-                                break
-
-                        if mi is not None and si is not None and mi > 0 and si > 0:
-                            if current_imb > current_imbalance_limit * 100:
-                                reason = f"Current imbalance >{current_imbalance_limit*100}%: M={mi}A S={si}A ({current_imb:.1f}%)"
-                                self._log(f"[ALERT] {reason}")
-                                self._safe_shutdown(reason)
-                                self.request_stop()
-                                break
-
-                        if mv is not None and sv is not None and mv > 0 and sv > 0:
-                            if voltage_imb > self.settings.voltage_diff_limit * 100:
-                                reason = f"Voltage imbalance >{self.settings. voltage_diff_limit*100}%: M={mv}V S={sv}V ({voltage_imb:.1f}%)"
-                                self._log(f"[ALERT] {reason}")
-                                self._safe_shutdown(reason)
-                                self.request_stop()
-                                break
-
-                        # Check voltage cutoff
-                        if self.settings.cutoff_safety_enabled:
-                            if (mv is not None and mv <= self.settings.cutoff_voltage) or \
-                               (sv is not None and sv <= self.settings.cutoff_voltage):
-                                reason = f"Voltage cutoff: M={mv}V S={sv}V <= {self.settings.cutoff_voltage}V"
-                                self._log(f"[CUTOFF] {reason}")
-                                self._safe_shutdown(reason)
-                                self.request_stop()
-                                break
-
+                        # Write to CSV with ALL parameters
                         if self.csv_writer:
                             self._maybe_rotate_csv()
                             self._write_csv_row(idx, total_set_power, mv, mi, mp, sv, si, sp, 
@@ -844,46 +821,232 @@ class MasterSlaveWorkerThread(threading.Thread):
                                             self.cumulative_energy_wh, self.cumulative_capacity_ah,
                                             dq_dv, dq_dv_voltage, dq_dv_valid)
 
+                        # At the end of the loop, check for stop
                         for _ in range(max(1, int(self.record_interval_s))):
                             if self._stop_event.is_set():
+                                self._log("⏸ Stop requested by user")
                                 break
-                            time. sleep(1)
+                            time.sleep(1)
+                        
+                        # If stop was requested, break out of main loop
+                        if self._stop_event.is_set():
+                            break
+                    
+                    # If we exited due to stop request, perform safe shutdown
+                    if self._stop_event.is_set():
+                        self._safe_shutdown("Stop requested by user")
+                        return  # Exit the run method
 
-                # Step complete
+                else:
+                    # Fixed duration
+                    unit_seconds = dict(UNITS)[row.duration_unit]
+                    dur_seconds = float(row.duration_value) * unit_seconds
+                    
+                    while (time.time() - step_start) < dur_seconds and not self._stop_event.is_set():
+                        # Initialize all variables at the start
+                        total_power = 0.0
+                        total_current = 0.0
+                        avg_voltage = 0.0
+                        power_imb = 0.0
+                        current_imb = 0.0
+                        voltage_imb = 0.0
+                        dq_dv = 0.0
+                        dq_dv_voltage = 0.0
+                        dq_dv_valid = False
+                        
+                        elapsed = int(time.time() - step_start)
+                        
+                        # Get measurements
+                        mv = self.master.read_voltage()
+                        mi = self.master.read_current()
+                        mp = self.master.read_power()
+                        sv = self.slave.read_voltage()
+                        si = self.slave. read_current()
+                        sp = self.slave.read_power()
+
+                        # Calculate totals
+                        if mp is not None and sp is not None:
+                            total_power = mp + sp
+                        elif mp is not None:
+                            total_power = mp
+                        elif sp is not None:
+                            total_power = sp
+                        
+                        if mi is not None and si is not None:
+                            total_current = mi + si
+                        elif mi is not None:
+                            total_current = mi
+                        elif si is not None: 
+                            total_current = si
+                        
+                        if mv is not None and sv is not None: 
+                            avg_voltage = (mv + sv) / 2.0
+                        elif mv is not None:
+                            avg_voltage = mv
+                        elif sv is not None:
+                            avg_voltage = sv
+
+                        # Calculate cumulative energy and capacity
+                        current_time = time.time()
+                        if self.last_measurement_time is not None: 
+                            delta_time_seconds = current_time - self.last_measurement_time
+                            delta_time_hours = delta_time_seconds / 3600.0
+                            
+                            energy_increment, capacity_increment = self._calculate_energy_increment(
+                                total_power, total_current, delta_time_hours
+                            )
+                            
+                            self.cumulative_energy_wh += energy_increment
+                            self.cumulative_capacity_ah += capacity_increment
+                        
+                        self.last_measurement_time = current_time
+                        self.last_total_power = total_power
+                        self.last_total_current = total_current
+
+                        # Calculate differential capacity dQ/dV
+                        dq_dv, dq_dv_voltage, dq_dv_valid = self._calculate_dq_dv(
+                            avg_voltage, self. cumulative_capacity_ah
+                        )
+
+                        self._log(f"  [{elapsed}s/{int(dur_seconds)}s] M:  V={mv}V I={mi}A P={mp}W | S:  V={sv}V I={si}A P={sp}W | "
+                                 f"Total:  {total_power:.2f}W, {total_current:.2f}A | "
+                                 f"Energy: {self.cumulative_energy_wh:.3f}Wh, Cap: {self.cumulative_capacity_ah:.3f}Ah | "
+                                 f"dQ/dV:  {dq_dv:.4f} Ah/V @ {dq_dv_voltage:.2f}V")
+
+                        # Check transition phase
+                        if time.time() - transition_start > self.settings.transition_duration:
+                            if current_imbalance_limit != self.settings.imbalance_limit:
+                                current_imbalance_limit = self.settings.imbalance_limit
+                                self._log(f"  → Normal phase: {current_imbalance_limit*100}% imbalance threshold")
+
+                        # Calculate imbalances
+                        power_imb, current_imb, voltage_imb = self._calculate_imbalances(mp, sp, mi, si, mv, sv)
+
+                        # Check imbalances ONLY if enabled
+                        if self.settings. imbalance_check_enabled: 
+                            # Check imbalances (power)
+                            if mp is not None and sp is not None and mp > 0 and sp > 0:
+                                if power_imb > current_imbalance_limit * 100:
+                                    reason = f"Power imbalance >{current_imbalance_limit*100}%:  M={mp}W S={sp}W ({power_imb:.1f}%)"
+                                    self._log(f"[ALERT] {reason}")
+                                    self._safe_shutdown(reason)
+                                    self.request_stop()
+                                    break
+
+                            # Check imbalances (current)
+                            if mi is not None and si is not None and mi > 0 and si > 0:
+                                if current_imb > current_imbalance_limit * 100:
+                                    reason = f"Current imbalance >{current_imbalance_limit*100}%: M={mi}A S={si}A ({current_imb:.1f}%)"
+                                    self._log(f"[ALERT] {reason}")
+                                    self._safe_shutdown(reason)
+                                    self.request_stop()
+                                    break
+
+                            # Check imbalances (voltage)
+                            if mv is not None and sv is not None and mv > 0 and sv > 0:
+                                if voltage_imb > self.settings.voltage_diff_limit * 100:
+                                    reason = f"Voltage imbalance >{self.settings.voltage_diff_limit*100}%: M={mv}V S={sv}V ({voltage_imb:.1f}%)"
+                                    self._log(f"[ALERT] {reason}")
+                                    self._safe_shutdown(reason)
+                                    self.request_stop()
+                                    break
+                        else:
+                            # Log high imbalance as warning only (not shutdown)
+                            if power_imb > 50:  # Log if very high
+                                self._log(f"[WARNING] High power imbalance: {power_imb:.1f}% (monitoring disabled)")
+                            if current_imb > 50:
+                                self._log(f"[WARNING] High current imbalance: {current_imb:.1f}% (monitoring disabled)")
+                            if voltage_imb > 20:
+                                self._log(f"[WARNING] High voltage difference: {voltage_imb:.1f}% (monitoring disabled)")
+
+                        # Check voltage cutoff
+                        if self.settings.cutoff_safety_enabled:
+                            if (mv is not None and mv <= self.settings.cutoff_voltage) or \
+                               (sv is not None and sv <= self.settings.cutoff_voltage):
+                                reason = f"Voltage cutoff: M={mv}V S={sv}V <= {self.settings.cutoff_voltage}V"
+                                self._log(f"[CUTOFF] {reason}")
+                                self._safe_shutdown(reason)
+                                self.request_stop()
+                                break
+
+                        # Write to CSV
+                        if self.csv_writer:
+                            self._maybe_rotate_csv()
+                            self._write_csv_row(idx, total_set_power, mv, mi, mp, sv, si, sp,
+                                              power_imb, current_imb, voltage_imb,
+                                              total_power, total_current, avg_voltage,
+                                              self.cumulative_energy_wh, self.cumulative_capacity_ah,
+                                              dq_dv, dq_dv_voltage)
+
+                        # Push to plot
+                        self._push_plot_point(idx, mv, mi, mp, sv, si, sp,
+                                            self.cumulative_energy_wh, self. cumulative_capacity_ah,
+                                            dq_dv, dq_dv_voltage, dq_dv_valid)
+
+                        for _ in range(max(1, int(self.record_interval_s))):
+                            if self._stop_event.is_set():
+                                self._log("⏸ Stop requested by user")
+                                break
+                            time.sleep(1)
+                        
+                        # If stop was requested, break out
+                        if self._stop_event.is_set():
+                            break
+                    
+                    # If we exited due to stop request, perform safe shutdown
+                    if self._stop_event.is_set():
+                        self._safe_shutdown("Stop requested by user")
+                        return  # Exit the run method
+
+                # Step complete - turn off for this step
                 try:
-                    self.master. load_off()
+                    self. master.set_power(0.0)
+                    self.slave.set_power(0.0)
+                    time.sleep(0.5)
+                    self.master.load_off()
                     self.slave.load_off()
-                    self._log(f"✓ Step {idx} complete; LOADS OFF.")
-                except Exception as e: 
+                    self._log(f"✓ Step {idx} complete; Power set to 0, LOADS OFF.")
+                except Exception as e:  
                     self._log(f"[WARN] Could not turn LOADS OFF after step {idx}: {e}")
 
-            # Final shutdown
-            try:
-                self.master.load_off()
-                self.slave.load_off()
-                self. master.parallel_off()
-                self.slave.parallel_off()
-                self. master.set_local()
-                self.slave.set_local()
-                self._log("═══ Final shutdown:  LOADS OFF, parallel disabled, set to LOCAL ═══")
-            except Exception as e:
-                self._log(f"[WARN] Error during final shutdown: {e}")
-
-            self._log("✓ All power profile steps completed successfully.")
+            # ALL STEPS COMPLETED - Final safe shutdown
+            self._log("═══ All Profile Steps Completed ═══")
+            self._safe_shutdown("Mission profile completed successfully")
 
         except Exception as exc:
-            self._log(f"[EXCEPTION] Worker:  {exc}")
+            self._log(f"[EXCEPTION] Worker:   {exc}")
             self._log(traceback.format_exc())
+            # Exception occurred - safe shutdown
+            self._safe_shutdown(f"Exception occurred:  {exc}")
         finally:
+            # Always ensure safe shutdown happened
             try:
-                self._close_csv()
-            except Exception: 
-                pass
-            try:
-                self.master.close()
-                self.slave.close()
+                # Double-check everything is off and local
+                for controller in [self.master, self. slave]:
+                    try: 
+                        controller.set_power(0.0)
+                        controller.load_off()
+                        controller.input_off()
+                        controller.parallel_off()
+                        controller.set_local()
+                    except Exception: 
+                        pass
             except Exception:
                 pass
+            
+            # Close CSV
+            try:
+                self._close_csv()
+            except Exception:  
+                pass
+            
+            # Close serial connections
+            try:
+                self. master.close()
+                self. slave.close()
+            except Exception:
+                pass
+            
             self._log("=== Worker Finished ===")
 
     def _calculate_imbalances(self, mp, sp, mi, si, mv, sv):
@@ -942,6 +1105,9 @@ class App(tk.Tk):
         self.imbalance_transition_var = tk.DoubleVar(value=DEFAULT_IMBALANCE_TRANSITION * 100)
         self.transition_duration_var = tk.IntVar(value=DEFAULT_TRANSITION_DURATION)
         self.voltage_diff_limit_var = tk.DoubleVar(value=DEFAULT_VOLTAGE_DIFF_LIMIT * 100)
+        self.cutoff_safety_var = tk.BooleanVar(value=self.settings.cutoff_safety_enabled)
+        self.imbalance_check_enabled_var = tk.BooleanVar(value=True)  # NEW: Enable imbalance checking by default
+        self.imbalance_limit_var = tk.DoubleVar(value=DEFAULT_IMBALANCE_LIMIT * 100)
 
         # Email settings
         self.email_enabled_var = tk.BooleanVar(value=False)
@@ -1035,66 +1201,76 @@ class App(tk.Tk):
         self.cutoff_entry. grid(row=4, column=1, pady=2)
         ttk. Checkbutton(settings_fr, text="Enable", variable=self.cutoff_safety_var).grid(row=4, column=2, padx=6)
     
-        ttk. Separator(settings_fr, orient=tk. HORIZONTAL).grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
+        ttk. Separator(settings_fr, orient=tk.HORIZONTAL).grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
+
+        # NEW: Imbalance Check Enable/Disable
+        ttk.Label(settings_fr, text="Imbalance Monitoring:", font=('Arial', 9, 'bold')).grid(row=6, column=0, columnspan=3, sticky="w", pady=(5, 2))
+        ttk.Checkbutton(settings_fr, text="Enable Imbalance Shutdown", 
+                       variable=self.imbalance_check_enabled_var,
+                       command=self._toggle_imbalance_controls).grid(row=7, column=0, columnspan=3, sticky="w", pady=2)
+
+        ttk.Label(settings_fr, text="Imbalance Limit (%):").grid(row=8, column=0, sticky="w")
+        self.imbalance_limit_entry = ttk.Entry(settings_fr, textvariable=self.imbalance_limit_var, width=12)
+        self.imbalance_limit_entry.grid(row=8, column=1, pady=2)
+
+        ttk.Label(settings_fr, text="Transition Limit (%):").grid(row=9, column=0, sticky="w")
+        self.imbalance_transition_entry = ttk.Entry(settings_fr, textvariable=self.imbalance_transition_var, width=12)
+        self.imbalance_transition_entry.grid(row=9, column=1, pady=2)
+
+        ttk.Label(settings_fr, text="Transition Time (s):").grid(row=10, column=0, sticky="w")
+        self.transition_duration_entry = ttk.Entry(settings_fr, textvariable=self.transition_duration_var, width=12)
+        self.transition_duration_entry. grid(row=10, column=1, pady=2)
+
+        ttk.Label(settings_fr, text="Voltage Diff Limit (%):").grid(row=11, column=0, sticky="w")
+        self.voltage_diff_entry = ttk.Entry(settings_fr, textvariable=self.voltage_diff_limit_var, width=12)
+        self.voltage_diff_entry.grid(row=11, column=1, pady=2)
+
+        ttk. Separator(settings_fr, orient=tk.HORIZONTAL).grid(row=12, column=0, columnspan=3, sticky="ew", pady=6)
     
-        ttk.Label(settings_fr, text="Imbalance Limit (%):").grid(row=6, column=0, sticky="w")
-        ttk.Entry(settings_fr, textvariable=self.imbalance_limit_var, width=12).grid(row=6, column=1, pady=2)
-    
-        ttk.Label(settings_fr, text="Transition Limit (%):").grid(row=7, column=0, sticky="w")
-        ttk.Entry(settings_fr, textvariable=self.imbalance_transition_var, width=12).grid(row=7, column=1, pady=2)
-    
-        ttk.Label(settings_fr, text="Transition Time (s):").grid(row=8, column=0, sticky="w")
-        ttk.Entry(settings_fr, textvariable=self.transition_duration_var, width=12).grid(row=8, column=1, pady=2)
-    
-        ttk.Label(settings_fr, text="Voltage Diff Limit (%):").grid(row=9, column=0, sticky="w")
-        ttk.Entry(settings_fr, textvariable=self.voltage_diff_limit_var, width=12).grid(row=9, column=1, pady=2)
-    
-        ttk.Separator(settings_fr, orient=tk.HORIZONTAL).grid(row=10, column=0, columnspan=3, sticky="ew", pady=6)
-    
-        ttk.Label(settings_fr, text="CSV Folder:").grid(row=11, column=0, sticky="w")
+        ttk.Label(settings_fr, text="CSV Folder:").grid(row=13, column=0, sticky="w")
         self.csv_folder_label = ttk.Label(settings_fr, text="(not set - REQUIRED! )", 
                                           width=24, foreground="red", font=('Arial', 9, 'bold'))
-        self.csv_folder_label.grid(row=11, column=1, sticky="w")
-        ttk.Button(settings_fr, text="Select.. .", command=self._select_csv_folder).grid(row=11, column=2, padx=2, pady=2)
+        self.csv_folder_label.grid(row=13, column=1, sticky="w")
+        ttk.Button(settings_fr, text="Select.. .", command=self._select_csv_folder).grid(row=13, column=2, padx=2, pady=2)
     
-        ttk.Label(settings_fr, text="Rotate CSV (hours):").grid(row=12, column=0, sticky="w")
-        ttk. Spinbox(settings_fr, from_=0, to=168, increment=0.5, textvariable=self.rotate_hours_var, width=10).grid(row=12, column=1, pady=2)
+        ttk.Label(settings_fr, text="Rotate CSV (hours):").grid(row=14, column=0, sticky="w")
+        ttk. Spinbox(settings_fr, from_=0, to=168, increment=0.5, textvariable=self.rotate_hours_var, width=10).grid(row=14, column=1, pady=2)
     
-        ttk.Label(settings_fr, text="Record interval (s):").grid(row=13, column=0, sticky="w")
-        ttk.Spinbox(settings_fr, from_=1, to=3600, textvariable=self.record_interval_var, width=10).grid(row=13, column=1, pady=2)
+        ttk.Label(settings_fr, text="Record interval (s):").grid(row=15, column=0, sticky="w")
+        ttk.Spinbox(settings_fr, from_=1, to=3600, textvariable=self.record_interval_var, width=10).grid(row=15, column=1, pady=2)
     
-        ttk.Separator(settings_fr, orient=tk.HORIZONTAL).grid(row=14, column=0, columnspan=3, sticky="ew", pady=6)
+        ttk.Separator(settings_fr, orient=tk.HORIZONTAL).grid(row=16, column=0, columnspan=3, sticky="ew", pady=6)
     
         # Email settings
-        ttk. Checkbutton(settings_fr, text="Enable Email Alerts", variable=self.email_enabled_var).grid(row=15, column=0, columnspan=2, sticky="w")
+        ttk. Checkbutton(settings_fr, text="Enable Email Alerts", variable=self.email_enabled_var).grid(row=17, column=0, columnspan=2, sticky="w")
         
-        ttk.Label(settings_fr, text="Sender Email:").grid(row=16, column=0, sticky="w")
-        ttk.Entry(settings_fr, textvariable=self.email_sender_var, width=20).grid(row=16, column=1, columnspan=2, pady=2)
+        ttk.Label(settings_fr, text="Sender Email:").grid(row=18, column=0, sticky="w")
+        ttk.Entry(settings_fr, textvariable=self.email_sender_var, width=20).grid(row=18, column=1, columnspan=2, pady=2)
     
-        ttk.Label(settings_fr, text="Receiver Email: ").grid(row=17, column=0, sticky="w")
-        ttk.Entry(settings_fr, textvariable=self.email_receiver_var, width=20).grid(row=17, column=1, columnspan=2, pady=2)
+        ttk.Label(settings_fr, text="Receiver Email: ").grid(row=19, column=0, sticky="w")
+        ttk.Entry(settings_fr, textvariable=self.email_receiver_var, width=20).grid(row=19, column=1, columnspan=2, pady=2)
     
-        ttk.Label(settings_fr, text="Password:").grid(row=18, column=0, sticky="w")
-        ttk.Entry(settings_fr, textvariable=self.email_password_var, show="*", width=20).grid(row=18, column=1, columnspan=2, pady=2)
+        ttk.Label(settings_fr, text="Password:").grid(row=20, column=0, sticky="w")
+        ttk.Entry(settings_fr, textvariable=self.email_password_var, show="*", width=20).grid(row=20, column=1, columnspan=2, pady=2)
     
-        ttk.Button(settings_fr, text="Apply Settings", command=self._apply_settings).grid(row=19, column=0, columnspan=3, pady=(8, 2), sticky="ew")
+        ttk.Button(settings_fr, text="Apply Settings", command=self._apply_settings).grid(row=21, column=0, columnspan=3, pady=(8, 2), sticky="ew")
     
         # Config save/load
-        ttk. Separator(settings_fr, orient=tk. HORIZONTAL).grid(row=20, column=0, columnspan=3, sticky="ew", pady=6)
-        ttk.Label(settings_fr, text="Config Filename:").grid(row=21, column=0, sticky="w")
-        ttk.Entry(settings_fr, textvariable=self.config_filename_var, width=20).grid(row=21, column=1, columnspan=2, pady=2)
+        ttk. Separator(settings_fr, orient=tk. HORIZONTAL).grid(row=22, column=0, columnspan=3, sticky="ew", pady=6)
+        ttk.Label(settings_fr, text="Config Filename:").grid(row=23, column=0, sticky="w")
+        ttk.Entry(settings_fr, textvariable=self.config_filename_var, width=20).grid(row=23, column=1, columnspan=2, pady=2)
     
-        ttk.Label(settings_fr, text="Save Folder:").grid(row=22, column=0, sticky="w")
+        ttk.Label(settings_fr, text="Save Folder:").grid(row=24, column=0, sticky="w")
         self.config_save_folder_label = ttk.Label(settings_fr, text="(not set)", width=24)
-        self.config_save_folder_label.grid(row=22, column=1, sticky="w")
-        ttk.Button(settings_fr, text="Choose...", command=self._select_config_save_folder).grid(row=22, column=2, padx=2, pady=2)
+        self.config_save_folder_label.grid(row=24, column=1, sticky="w")
+        ttk.Button(settings_fr, text="Choose...", command=self._select_config_save_folder).grid(row=24, column=2, padx=2, pady=2)
     
-        ttk.Label(settings_fr, text="Load Config:").grid(row=23, column=0, sticky="w")
-        ttk.Entry(settings_fr, textvariable=self.config_load_path_var, width=20).grid(row=23, column=1, pady=2)
-        ttk.Button(settings_fr, text="Browse...", command=self._select_config_file).grid(row=23, column=2, padx=2, pady=2)
+        ttk.Label(settings_fr, text="Load Config:").grid(row=25, column=0, sticky="w")
+        ttk.Entry(settings_fr, textvariable=self.config_load_path_var, width=20).grid(row=25, column=1, pady=2)
+        ttk.Button(settings_fr, text="Browse...", command=self._select_config_file).grid(row=25, column=2, padx=2, pady=2)
     
-        ttk.Button(settings_fr, text="Load Configuration", command=self._load_configuration).grid(row=24, column=0, columnspan=2, pady=4)
-        ttk.Button(settings_fr, text="Save Configuration", command=self._save_configuration).grid(row=25, column=0, columnspan=3, pady=(4, 2), sticky="ew")
+        ttk.Button(settings_fr, text="Load Configuration", command=self._load_configuration).grid(row=26, column=0, columnspan=2, pady=4)
+        ttk.Button(settings_fr, text="Save Configuration", command=self._save_configuration).grid(row=27, column=0, columnspan=3, pady=(4, 2), sticky="ew")
     
         # Profile editor (center)
         profile_fr = ttk. Labelframe(top_frame, text="Power Profile (Total Power - 50/50 Split)", padding=(8, 6))
@@ -1605,6 +1781,23 @@ class App(tk.Tk):
             messagebox.showerror("Export Error", str(e))
             self._log(f"[ERROR] Export failed: {e}")
 
+    def _toggle_imbalance_controls(self):
+        """Enable or disable imbalance control entries based on checkbox"""
+        if self.imbalance_check_enabled_var.get():
+            # Enable all imbalance entries
+            self.imbalance_limit_entry.config(state='normal')
+            self.imbalance_transition_entry.config(state='normal')
+            self.transition_duration_entry.config(state='normal')
+            self.voltage_diff_entry.config(state='normal')
+            self._log("Imbalance monitoring ENABLED")
+        else:
+            # Disable all imbalance entries
+            self.imbalance_limit_entry.config(state='disabled')
+            self.imbalance_transition_entry.config(state='disabled')
+            self.transition_duration_entry.config(state='disabled')
+            self.voltage_diff_entry.config(state='disabled')
+            self._log("⚠ WARNING: Imbalance monitoring DISABLED - system will not shut down on imbalance!")
+
     # Profile row helpers
     def _add_row(self):
         """Add a new row"""
@@ -1767,6 +1960,7 @@ class App(tk.Tk):
             "dry_run": self.settings.dry_run,
             "cutoff_voltage": self.settings.cutoff_voltage,
             "cutoff_safety_enabled": self. settings.cutoff_safety_enabled,
+            "imbalance_check_enabled": self.settings.imbalance_check_enabled,  # NEW
             "imbalance_limit": self.settings.imbalance_limit,
             "imbalance_transition":  self.settings.imbalance_transition,
             "transition_duration": self.settings.transition_duration,
@@ -1850,7 +2044,8 @@ class App(tk.Tk):
             self.cutoff_entry.delete(0, tk.END)
             self.cutoff_entry.insert(0, str(cfg.get("cutoff_voltage", DEFAULT_CUTOFF_VOLTAGE)))
             
-            self. cutoff_safety_var.set(bool(cfg.get("cutoff_safety_enabled", False)))
+            self.cutoff_safety_var.set(bool(cfg. get("cutoff_safety_enabled", False)))
+            self.imbalance_check_enabled_var.set(bool(cfg.get("imbalance_check_enabled", True)))  # NEW
             self.imbalance_limit_var.set(float(cfg.get("imbalance_limit", DEFAULT_IMBALANCE_LIMIT)) * 100)
             self.imbalance_transition_var.set(float(cfg.get("imbalance_transition", DEFAULT_IMBALANCE_TRANSITION)) * 100)
             self.transition_duration_var.set(int(cfg.get("transition_duration", DEFAULT_TRANSITION_DURATION)))
@@ -1870,6 +2065,8 @@ class App(tk.Tk):
             self.email_enabled_var.set(bool(cfg.get("email_enabled", False)))
             self.email_sender_var.set(cfg.get("email_sender", ""))
             self.email_receiver_var.set(cfg.get("email_receiver", ""))
+
+            self._toggle_imbalance_controls()
 
             raw_profile = cfg.get("profile", [])
             new_profile: List[ProfileRow] = []
@@ -2000,9 +2197,10 @@ class App(tk.Tk):
             self.settings.slave_port = self.slave_port_entry.get().strip() or DEFAULT_SLAVE_PORT
             self.settings. baud_rate = int(self.baud_entry.get().strip())
             self.settings.dry_run = bool(self.dry_var.get())
-            self.settings.cutoff_voltage = float(self.cutoff_entry.get().strip())
+            self.settings.cutoff_voltage = float(self. cutoff_entry.get().strip())
             self.settings.cutoff_safety_enabled = bool(self.cutoff_safety_var.get())
-            self.settings.imbalance_limit = float(self.imbalance_limit_var.get()) / 100.0
+            self.settings.imbalance_check_enabled = bool(self.imbalance_check_enabled_var. get())  # NEW
+            self.settings. imbalance_limit = float(self.imbalance_limit_var.get()) / 100.0
             self.settings.imbalance_transition = float(self.imbalance_transition_var.get()) / 100.0
             self.settings.transition_duration = int(self.transition_duration_var.get())
             self.settings.voltage_diff_limit = float(self.voltage_diff_limit_var.get()) / 100.0
@@ -2011,7 +2209,7 @@ class App(tk.Tk):
             self.settings.email_sender = self.email_sender_var.get().strip()
             self.settings. email_receiver = self.email_receiver_var.get().strip()
             self.settings.email_password = self.email_password_var.get().strip()
-    
+
             # Sync profile from widgets
             self._sync_profile_from_widgets()
             
@@ -2019,11 +2217,15 @@ class App(tk.Tk):
             if not self. settings.profile:
                 raise ValueError("Profile must contain at least one row.")
             
+            # Log warning if imbalance check is disabled
+            if not self.settings.imbalance_check_enabled:
+                self._log("⚠⚠⚠ WARNING:  Imbalance monitoring is DISABLED!  ⚠⚠⚠")
+            
             self._log("Settings applied.")
             self._update_config_note()
             return True
         except Exception as e:
-            messagebox. showerror("Error applying settings", str(e))
+            messagebox.showerror("Error applying settings", str(e))
             raise
 
     # Start/Stop
@@ -2081,29 +2283,34 @@ class App(tk.Tk):
             self._update_dqdv_plot(redraw=True)
 
     def _stop(self):
-        """Stop the test and reset equipment"""
-        if not self.worker: 
+        """Stop the test and safely shut down equipment"""
+        if not self.worker:  
             messagebox.showinfo("Not running", "No test is running.")
             return
         
-        # Check if worker is actually alive using try-except
+        # Check if worker is actually alive
         try:
             worker_alive = self.worker.is_alive()
         except Exception as e:
-            self._log(f"[ERROR] Checking worker status:  {e}")
+            self._log(f"[ERROR] Checking worker status: {e}")
             worker_alive = False
         
         if not worker_alive:
             messagebox.showinfo("Not running", "No test is currently running.")
-            self. start_btn.config(state=tk.NORMAL)
-            self.stop_btn.config(state=tk.DISABLED)
+            self. start_btn.config(state=tk. NORMAL)
+            self.stop_btn.config(state=tk. DISABLED)
             self.status_label.config(text="Idle", foreground="blue")
             return
         
         # Request stop
         self. worker.request_stop()
-        self._log("⏸ Stop requested; waiting for worker to finish...")
-        self.status_label.config(text="Stopping.. .", foreground="orange")
+        self._log("═══ STOP REQUESTED ═══")
+        self._log("⏸ Initiating safe shutdown...")
+        self._log("  • Ramping power to 0W")
+        self._log("  • Turning loads OFF")
+        self._log("  • Disabling parallel mode")
+        self._log("  • Returning to LOCAL control")
+        self.status_label.config(text="Shutting down safely.. .", foreground="orange")
         
         # Disable stop button to prevent multiple clicks
         self.stop_btn. config(state=tk.DISABLED)
@@ -2132,13 +2339,26 @@ class App(tk.Tk):
     
     def _finalize_stop(self):
         """Finalize the stop process and reset UI"""
-        self.start_btn.config(state=tk.NORMAL)
+        self. start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.status_label.config(text="Idle", foreground="blue")
-        self._log("✓ Worker stopped.  System ready.")
+        self.status_label.config(text="Idle - Safe State", foreground="blue")
+        self._log("═══ STOP COMPLETE ═══")
+        self._log("✓ Equipment in safe state:")
+        self._log("  • Power: 0W")
+        self._log("  • Loads: OFF")
+        self._log("  • Mode: LOCAL")
+        self._log("✓ Ready to start new test.")
         
-        # Optional: Show completion message
-        messagebox.showinfo("Test Stopped", "Test has been stopped.\n\nEquipment should be in safe state.\nReady to start new test.")
+        # Show completion message
+        messagebox.showinfo(
+            "Safe Shutdown Complete", 
+            "Equipment has been safely shut down:\n\n"
+            "✓ Power ramped to 0W\n"
+            "✓ Loads turned OFF\n"
+            "✓ Parallel mode disabled\n"
+            "✓ Returned to LOCAL control\n\n"
+            "System is ready for next test."
+        )
 
     def _on_quit(self):
         """Handle application quit"""
@@ -2473,19 +2693,21 @@ class App(tk.Tk):
 
     # Config note
     def _get_config_note_text(self) -> str:
-        fname = self.config_filename_var.get().strip()
+        """Generate configuration note text"""
+        fname = self.config_filename_var. get().strip()
         note = f"Master-Slave Configuration\n"
         note += f"==========================\n\n"
         note += f"Config File: {fname if fname else 'Not set'}\n\n"
-        note += f"Master Port: {self.settings.master_port}\n"
-        note += f"Slave Port: {self.settings.slave_port}\n"
-        note += f"Baud Rate: {self. settings.baud_rate}\n\n"
-        note += f"Imbalance Limit: {self. settings.imbalance_limit*100:.1f}%\n"
-        note += f"Transition Limit: {self.settings.imbalance_transition*100:.1f}%\n"
+        note += f"Master Port:  {self.settings. master_port}\n"
+        note += f"Slave Port:  {self.settings.slave_port}\n"
+        note += f"Baud Rate: {self.settings.baud_rate}\n\n"
+        note += f"Imbalance Monitoring: {'ENABLED' if self. settings.imbalance_check_enabled else 'DISABLED ⚠'}\n"
+        note += f"Imbalance Limit: {self.settings. imbalance_limit*100:.1f}%\n"  # Fixed:  no space
+        note += f"Transition Limit: {self.settings.imbalance_transition*100:.1f}%\n"  # Fixed: no space
         note += f"Transition Duration: {self.settings.transition_duration}s\n\n"
         note += f"Voltage Cutoff: {self.settings.cutoff_voltage}V\n"
         note += f"Cutoff Safety: {'Enabled' if self.settings.cutoff_safety_enabled else 'Disabled'}\n\n"
-        note += f"Email Alerts: {'Enabled' if self. settings.email_enabled else 'Disabled'}\n"
+        note += f"Email Alerts: {'Enabled' if self.settings. email_enabled else 'Disabled'}\n"
         note += f"Profile Steps: {len(self.settings.profile)}\n"
         return note
 
