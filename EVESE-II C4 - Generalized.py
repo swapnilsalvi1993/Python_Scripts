@@ -243,7 +243,7 @@ if __name__ == '__main__':
                 print("\n\nFirst processed file loaded into DataFrame 'd' for further analysis.")
                 print(d.head())
                 
-                # Create Q_gen Analysis
+                # Create Q_gen Analysis (results saved to Excel and available in qgen_df for further analysis)
                 qgen_df = create_qgen_analysis(d)
                 
 
