@@ -155,7 +155,7 @@ def create_qgen_analysis(data, output_path=None):
         peak_heat_rate_kW = peak_heat_rate_W / 1000
         time_at_peak = time_sec[peak_idx]
         temp_at_peak = temp_cell[peak_idx]
-        total_energy_kJ = E_cell_cumulative[-1] / 1000 if len(E_cell_cumulative) > 0 else 0
+        total_energy_kJ = E_cell_cumulative[-1] if len(E_cell_cumulative) > 0 else 0
         
         # Print summary metrics
         print("✓ Heat generation analysis completed:")
