@@ -28,8 +28,8 @@ ALL_PLOT_PARAMS = {
     ],
     
     'Pressure Plots': [
-        ('Maximum Pressure', 'PSIG', 'Usable Capacity', '%', 'Max_Pressure_vs_UsableCapacity', 'pressure', 'Maximum Pressure vs Usable Capacity'),
-        ('Pressure at t=60 sec', 'PSIG', 'Usable Capacity', '%', 'Pressure_60sec_vs_UsableCapacity', 'pressure', 'Pressure at t=60 sec vs Usable Capacity'),
+        ('Maximum Pressure', 'PSIG', 'Usable Capacity', '%', 'Max_Pressure_vs_UsableCapacity', 'max_pressure', 'Maximum Pressure vs Usable Capacity'),
+        ('Pressure at t=60 sec', 'PSIG', 'Usable Capacity', '%', 'Pressure_60sec_vs_UsableCapacity', 'pressure_60sec', 'Pressure at t=60 sec vs Usable Capacity'),
     ],
     
     'Energy Plots': [
@@ -100,11 +100,12 @@ class PlotSelectionDialog:
         self.category_vars = {}
         self.fitting_line_12_var = None
         self.fitting_line_134_var = None
+        self.show_cov_var = None
         
         # Create dialog window
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Select Plots to Generate")
-        self.dialog.geometry("700x850")
+        self.dialog.geometry("700x900")
         
         # Make sure dialog appears on top
         self.dialog.lift()
@@ -199,6 +200,22 @@ class PlotSelectionDialog:
         
         row += 1
         
+        # Statistical Analysis Frame
+        stats_frame = ttk.LabelFrame(scrollable_frame, text="Statistical Analysis Options", padding="10")
+        stats_frame.grid(row=row, column=0, sticky=(tk.W, tk.E), padx=5, pady=5)
+        stats_frame.columnconfigure(0, weight=1)
+        
+        # CoV checkbox
+        self.show_cov_var = tk.BooleanVar(value=False)
+        cov_cb = ttk.Checkbutton(
+            stats_frame,
+            text="Show Coefficient of Variation (CoV) for each Run (calculated from y-axis values only)",
+            variable=self.show_cov_var
+        )
+        cov_cb.grid(row=0, column=0, sticky=tk.W, pady=2)
+        
+        row += 1
+        
         # Button frame
         button_frame = ttk.Frame(main_frame)
         button_frame.grid(row=2, column=0, columnspan=2, pady=10)
@@ -275,6 +292,7 @@ class PlotSelectionDialog:
         print(f"Selected {len(self.result)} plots")
         print(f"Fitting Line Run1-2: {self.fitting_line_12_var.get()}")
         print(f"Fitting Line Run1-3-4: {self.fitting_line_134_var.get()}")
+        print(f"Show CoV: {self.show_cov_var.get()}")
         self.dialog.destroy()
     
     def cancel(self):
@@ -284,10 +302,10 @@ class PlotSelectionDialog:
         self.dialog.destroy()
     
     def show(self):
-        """Show dialog and return selected plots and fitting options"""
+        """Show dialog and return selected plots and options"""
         print("Waiting for user selection...")
         self.parent.wait_window(self.dialog)
-        return self.result, self.fitting_line_12_var.get(), self.fitting_line_134_var.get()
+        return self.result, self.fitting_line_12_var.get(), self.fitting_line_134_var.get(), self.show_cov_var.get()
 
 # Create root window for dialogs
 print("Initializing GUI...")
@@ -297,7 +315,7 @@ root.withdraw()
 # Show plot selection dialog
 try:
     dialog = PlotSelectionDialog(root)
-    selected_plots, add_fitting_12, add_fitting_134 = dialog.show()
+    selected_plots, add_fitting_12, add_fitting_134, show_cov = dialog.show()
 except Exception as e:
     print(f"Error creating dialog: {e}")
     import traceback
@@ -310,7 +328,8 @@ if not selected_plots:
     sys.exit(0)
 
 print(f"\n{len(selected_plots)} plots selected for generation.")
-print(f"Fitting lines enabled: Run1-2={add_fitting_12}, Run1-3-4={add_fitting_134}\n")
+print(f"Fitting lines enabled: Run1-2={add_fitting_12}, Run1-3-4={add_fitting_134}")
+print(f"Show CoV: {show_cov}\n")
 
 # Ask user to select output folder
 print("Opening folder selection dialog...")
@@ -458,6 +477,18 @@ def find_parameter_row(df_data, param_name, unit):
             return idx
     return None
 
+# Function to calculate coefficient of variation
+def calculate_cov(values):
+    """Calculate coefficient of variation (CoV) as percentage"""
+    if len(values) < 2:
+        return None
+    mean_val = np.mean(values)
+    if mean_val == 0:
+        return None
+    std_val = np.std(values, ddof=1)  # Sample standard deviation
+    cov = (std_val / mean_val) * 100
+    return cov
+
 # Function to collect data points for a parameter pair
 def collect_data_points(df_data, y_param_name, y_unit, x_param_name, x_unit):
     y_param_idx = find_parameter_row(df_data, y_param_name, y_unit)
@@ -500,13 +531,21 @@ for plot in plot_params:
         points = collect_data_points(df_data, y_param, y_unit, x_param, x_unit)
         temp_data.extend([y for x, y, t, r in points])
 
-# Collect data for pressure plots
-pressure_data = []
+# Collect data for max pressure plots
+max_pressure_data = []
 for plot in plot_params:
     y_param, y_unit, x_param, x_unit, file_name, category, display_name = plot
-    if category == 'pressure':
+    if category == 'max_pressure':
         points = collect_data_points(df_data, y_param, y_unit, x_param, x_unit)
-        pressure_data.extend([y for x, y, t, r in points])
+        max_pressure_data.extend([y for x, y, t, r in points])
+
+# Collect data for pressure at 60sec plots
+pressure_60sec_data = []
+for plot in plot_params:
+    y_param, y_unit, x_param, x_unit, file_name, category, display_name = plot
+    if category == 'pressure_60sec':
+        points = collect_data_points(df_data, y_param, y_unit, x_param, x_unit)
+        pressure_60sec_data.extend([y for x, y, t, r in points])
 
 # Calculate y-limits with some padding
 def calculate_ylim(data):
@@ -519,12 +558,15 @@ def calculate_ylim(data):
     return min_val - padding, max_val + padding
 
 temp_ylim = calculate_ylim(temp_data)
-pressure_ylim = calculate_ylim(pressure_data)
+max_pressure_ylim = calculate_ylim(max_pressure_data)
+pressure_60sec_ylim = calculate_ylim(pressure_60sec_data)
 
 if temp_ylim[0] is not None:
     print(f"Temperature y-limits: {temp_ylim}")
-if pressure_ylim[0] is not None:
-    print(f"Pressure y-limits: {pressure_ylim}")
+if max_pressure_ylim[0] is not None:
+    print(f"Maximum Pressure y-limits: {max_pressure_ylim}")
+if pressure_60sec_ylim[0] is not None:
+    print(f"Pressure at 60sec y-limits: {pressure_60sec_ylim}")
 print()
 
 print("Generating scatter plots...")
@@ -563,7 +605,7 @@ for plot_idx, plot in enumerate(plot_params, start=1):
     # Collect all data points for this parameter
     points_plotted = 0
     
-    # Store data points by run for fitting lines
+    # Store data points by run for fitting lines and CoV
     run_data = {'Run1': {'x': [], 'y': []}, 
                 'Run2': {'x': [], 'y': []}, 
                 'Run3': {'x': [], 'y': []}, 
@@ -599,7 +641,7 @@ for plot_idx, plot in enumerate(plot_params, start=1):
                              zorder=3)
                     points_plotted += 1
                     
-                    # Store data for fitting lines
+                    # Store data for fitting lines and CoV
                     run_data[run]['x'].append(x_val)
                     run_data[run]['y'].append(y_val)
             except Exception as e:
@@ -679,6 +721,20 @@ for plot_idx, plot in enumerate(plot_params, start=1):
             except Exception as e:
                 print(f"  ⚠ Could not create fitting line Run1-3-4: {e}")
     
+    # Calculate CoV for each run if requested
+    cov_values = []
+    if show_cov:
+        for run in runs:
+            if len(run_data[run]['y']) >= 2:
+                cov = calculate_cov(run_data[run]['y'])
+                if cov is not None:
+                    cov_values.append({
+                        'run': run,
+                        'cov': cov,
+                        'color': run_colors[run]
+                    })
+                    print(f"  ✓ {run} CoV: {cov:.2f}%")
+    
     # Customize plot
     ax.set_xlabel(f'{x_param_name} ({x_unit})', fontsize=14, fontweight='bold')
     ax.set_ylabel(f'{y_param_name} ({y_unit})', fontsize=14, fontweight='bold')
@@ -698,8 +754,10 @@ for plot_idx, plot in enumerate(plot_params, start=1):
     # Set y-limits based on category
     if category == 'temperature' and temp_ylim[0] is not None:
         ax.set_ylim(temp_ylim)
-    elif category == 'pressure' and pressure_ylim[0] is not None:
-        ax.set_ylim(pressure_ylim)
+    elif category == 'max_pressure' and max_pressure_ylim[0] is not None:
+        ax.set_ylim(max_pressure_ylim)
+    elif category == 'pressure_60sec' and pressure_60sec_ylim[0] is not None:
+        ax.set_ylim(pressure_60sec_ylim)
     
     # Add minor gridlines
     ax.minorticks_on()
@@ -758,7 +816,7 @@ for plot_idx, plot in enumerate(plot_params, start=1):
         legend_bbox = legend.get_window_extent().transformed(fig.transFigure.inverted())
         
         # Start equations just below the legend with very minimal gap
-        equation_y = legend_bbox.y0 - 0.015  # Reduced from 0.015 to 0.008
+        equation_y = legend_bbox.y0 - 0.015
         
         for eq_info in fitting_equations:
             equation_text = f"{eq_info['label']}: {eq_info['equation']},  {eq_info['r_squared']}"
@@ -767,14 +825,78 @@ for plot_idx, plot in enumerate(plot_params, start=1):
                     fontsize=11, color=eq_info['color'],
                     fontweight='bold',
                     transform=fig.transFigure)
-            equation_y -= 0.022  # Spacing between multiple equations (reduced from 0.020 to 0.018)
+            equation_y -= 0.022
     
-    # Adjust layout to make room for legend and equations below
-    bottom_margin = 0.08 if not fitting_equations else 0.08 + (len(fitting_equations) * 0.022)
+    # Add CoV values below fitting equations if requested (centralized like equations)
+    if cov_values:
+        # If no fitting equations, get legend bbox
+        if not fitting_equations:
+            fig.canvas.draw()
+            legend_bbox = legend.get_window_extent().transformed(fig.transFigure.inverted())
+            cov_y = legend_bbox.y0 - 0.015
+        else:
+            cov_y = equation_y - 0.005  # Small gap after fitting equations
+        
+        # Build CoV text line with colored segments using matplotlib's rich text capability
+        from matplotlib import patches
+        
+        # Create the full text string first
+        cov_text_parts = []
+        for cov_info in cov_values:
+            cov_text_parts.append(f"{cov_info['run']}: {cov_info['cov']:.2f}%")
+        
+        full_cov_text = "CoV: " + "   ".join(cov_text_parts)
+        
+        # Use a single centered text with manual color coding using matplotlib Text objects
+        # Create label part
+        label_text = "CoV:  "
+        
+        # Calculate approximate character widths for positioning
+        char_width = 0.0065  # Approximate character width in figure coordinates
+        
+        # Start position (centered, then adjust)
+        total_text_width = len(full_cov_text) * char_width
+        start_x = 0.5 - (total_text_width / 2)
+        current_x = start_x
+        
+        # Add label in black
+        fig.text(current_x, cov_y, label_text,
+                ha='left', va='top',
+                fontsize=11, color='black',
+                fontweight='bold',
+                transform=fig.transFigure)
+        current_x += len(label_text) * char_width
+        
+        # Add each run's CoV in its respective color
+        for idx, cov_info in enumerate(cov_values):
+            if idx > 0:
+                separator = "    "
+                fig.text(current_x, cov_y, separator,
+                        ha='left', va='top',
+                        fontsize=11, color='black',
+                        fontweight='bold',
+                        transform=fig.transFigure)
+                current_x += len(separator) * char_width
+            
+            run_text = f"{cov_info['run']}: {cov_info['cov']:.2f}%"
+            fig.text(current_x, cov_y, run_text,
+                    ha='left', va='top',
+                    fontsize=11, color=cov_info['color'],
+                    fontweight='bold',
+                    transform=fig.transFigure)
+            current_x += len(run_text) * char_width
+    
+    # Adjust layout to make room for legend, equations, and CoV below
+    extra_lines = len(fitting_equations) + (1 if cov_values else 0)
+    bottom_margin = 0.08 if extra_lines == 0 else 0.08 + (extra_lines * 0.022)
     plt.subplots_adjust(bottom=bottom_margin)
     
     # Save figure with descriptive name
-    output_filename = f'{file_name}.png'
+    if add_fitting_12 or add_fitting_134:
+        output_filename = f'Fitted_{file_name}.png'
+    else:
+        output_filename = f'{file_name}.png'
+    
     output_path = os.path.join(output_dir, output_filename)
     
     print(f"  Saving to: {output_filename}")
