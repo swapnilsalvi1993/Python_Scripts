@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
+import re
 
 class TDMSMatcher:
     def __init__(self, csv_file_path, tdms_folder_path):
@@ -274,75 +275,79 @@ class TDMSMatcher:
         else:
             return None, min_diff
     
-    def match_and_add_tdms_data(self, tdms_channel_name, new_column_name=None, tolerance_seconds=60):
+    def match_and_add_multiple_tdms_data(self, channel_mappings, tolerance_seconds=60):
         """
-        Match TDMS data to summary CSV and add as new column
+        Match multiple TDMS channels to summary CSV and add as new columns
         
         Args:
-            tdms_channel_name: Name of the TDMS channel to extract (e.g., '9211_6 TC2 T19 (C)')
-            new_column_name: Name for the new column in summary CSV (default: same as channel name)
+            channel_mappings: List of tuples (tdms_channel_name, new_column_name)
             tolerance_seconds: Maximum time difference in seconds for a valid match
         """
-        if new_column_name is None:
-            new_column_name = tdms_channel_name
-        
         # Load summary CSV
         self.read_summary_csv()
         
-        # Load all relevant TDMS data
-        channels_needed = ['Date/Time (Excel Format)', tdms_channel_name]
-        self.tdms_data_combined = self.load_all_relevant_tdms_data(channels_needed)
+        # Collect all channel names needed
+        all_channels = ['Date/Time (Excel Format)'] + [ch[0] for ch in channel_mappings]
         
-        if self.tdms_data_combined is None or tdms_channel_name not in self.tdms_data_combined.columns:
-            print(f"Error: Could not load TDMS data for channel '{tdms_channel_name}'")
+        # Load all relevant TDMS data
+        self.tdms_data_combined = self.load_all_relevant_tdms_data(all_channels)
+        
+        if self.tdms_data_combined is None:
+            print(f"Error: Could not load TDMS data")
             return
         
-        # Match each row in summary CSV
-        print(f"\n{'='*60}")
-        print(f"Matching TDMS data to Summary CSV...")
-        print(f"Tolerance: ±{tolerance_seconds} seconds")
-        print(f"{'='*60}\n")
-        
-        matched_values = []
-        match_time_diffs = []
-        match_count = 0
-        no_match_count = 0
-        
-        for idx, row in self.summary_df.iterrows():
-            target_dt = row['DateTime']
+        # Process each channel mapping
+        for tdms_channel_name, new_column_name in channel_mappings:
+            if tdms_channel_name not in self.tdms_data_combined.columns:
+                print(f"Warning: Channel '{tdms_channel_name}' not found in TDMS data, skipping...")
+                continue
             
-            matched_row, time_diff = self.find_nearest_match(
-                target_dt, 
-                self.tdms_data_combined, 
-                tolerance_seconds
-            )
+            print(f"\n{'='*60}")
+            print(f"Matching TDMS channel: {tdms_channel_name}")
+            print(f"To new column: {new_column_name}")
+            print(f"Tolerance: ±{tolerance_seconds} seconds")
+            print(f"{'='*60}\n")
             
-            if matched_row is not None:
-                value = matched_row[tdms_channel_name]
-                matched_values.append(value)
-                match_time_diffs.append(time_diff)
-                match_count += 1
-                print(f"Row {idx+1}: {target_dt} → Matched (Δ={time_diff:.1f}s, Value={value:.2f}°C)")
-            else:
-                matched_values.append(np.nan)
-                match_time_diffs.append(time_diff)
-                no_match_count += 1
-                print(f"Row {idx+1}: {target_dt} → No match (closest: {time_diff:.1f}s away)")
-        
-        # Add new columns to summary DataFrame
-        self.summary_df[new_column_name] = matched_values
-        self.summary_df[f'{new_column_name}_TimeDiff_s'] = match_time_diffs
-        
-        print(f"\n{'='*60}")
-        print(f"Matching Summary:")
-        print(f"  Total rows: {len(self.summary_df)}")
-        print(f"  Matched: {match_count}")
-        print(f"  No match: {no_match_count}")
-        print(f"  Match rate: {match_count/len(self.summary_df)*100:.1f}%")
-        if match_count > 0:
-            print(f"  Avg time difference: {np.mean([d for d in match_time_diffs if not np.isnan(d)]):.2f}s")
-            print(f"  Max time difference: {max([d for d in match_time_diffs if not np.isnan(d)]):.2f}s")
-        print(f"{'='*60}\n")
+            matched_values = []
+            match_time_diffs = []
+            match_count = 0
+            no_match_count = 0
+            
+            for idx, row in self.summary_df.iterrows():
+                target_dt = row['DateTime']
+                
+                matched_row, time_diff = self.find_nearest_match(
+                    target_dt, 
+                    self.tdms_data_combined, 
+                    tolerance_seconds
+                )
+                
+                if matched_row is not None:
+                    value = matched_row[tdms_channel_name]
+                    matched_values.append(value)
+                    match_time_diffs.append(time_diff)
+                    match_count += 1
+                    print(f"Row {idx+1}: {target_dt} → Matched (Δ={time_diff:.1f}s, Value={value:.2f})")
+                else:
+                    matched_values.append(np.nan)
+                    match_time_diffs.append(time_diff)
+                    no_match_count += 1
+                    print(f"Row {idx+1}: {target_dt} → No match (closest: {time_diff:.1f}s away)")
+            
+            # Add new columns to summary DataFrame
+            self.summary_df[new_column_name] = matched_values
+            self.summary_df[f'{new_column_name}_TimeDiff_s'] = match_time_diffs
+            
+            print(f"\n{'='*60}")
+            print(f"Matching Summary for {new_column_name}:")
+            print(f"  Total rows: {len(self.summary_df)}")
+            print(f"  Matched: {match_count}")
+            print(f"  No match: {no_match_count}")
+            print(f"  Match rate: {match_count/len(self.summary_df)*100:.1f}%")
+            if match_count > 0:
+                print(f"  Avg time difference: {np.mean([d for d in match_time_diffs if not np.isnan(d)]):.2f}s")
+                print(f"  Max time difference: {max([d for d in match_time_diffs if not np.isnan(d)]):.2f}s")
+            print(f"{'='*60}\n")
         
         return self.summary_df
     
@@ -371,7 +376,7 @@ class DataPlotterWindow:
     def __init__(self, parent, csv_path):
         self.window = tk.Toplevel(parent)
         self.window.title("Data Plotter")
-        self.window.geometry("1400x1050")
+        self.window.geometry("1400x900")
         
         self.csv_path = csv_path
         self.df = None
@@ -400,12 +405,46 @@ class DataPlotterWindow:
                     return
     
     def setup_ui(self):
-        """Setup the plotter UI"""
-        # Control Panel
-        control_frame = tk.Frame(self.window, padx=10, pady=10)
-        control_frame.pack(side=tk.TOP, fill=tk.X)
+        """Setup the plotter UI with tabs"""
+        # Create notebook (tab container)
+        self.notebook = ttk.Notebook(self.window)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        tk.Label(control_frame, text="Data Plotter", font=("Arial", 14, "bold")).pack()
+        # Create two tabs
+        self.controls_tab = ttk.Frame(self.notebook)
+        self.plot_tab = ttk.Frame(self.notebook)
+        
+        self.notebook.add(self.controls_tab, text="⚙ Controls & Settings")
+        self.notebook.add(self.plot_tab, text="📊 Plot Preview")
+        
+        # Setup controls tab
+        self.setup_controls_tab()
+        
+        # Setup plot tab
+        self.setup_plot_tab()
+        
+    def setup_controls_tab(self):
+        """Setup the controls tab with all settings"""
+        # Make the controls scrollable
+        canvas = tk.Canvas(self.controls_tab)
+        scrollbar = ttk.Scrollbar(self.controls_tab, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        control_frame = ttk.Frame(scrollable_frame, padding=10)
+        control_frame.pack(fill=tk.BOTH, expand=True)
+        
+        tk.Label(control_frame, text="Data Plotter Configuration", font=("Arial", 14, "bold")).pack(pady=10)
         
         # Column selection frame
         selection_frame = tk.LabelFrame(control_frame, text="Select Columns to Plot", padx=10, pady=10)
@@ -448,7 +487,7 @@ class DataPlotterWindow:
         controls_frame = tk.LabelFrame(control_frame, text="Plot Controls", padx=10, pady=10)
         controls_frame.pack(fill=tk.X, pady=10)
         
-        # Row 1: Font, Marker, Plot Size
+        # Row 1: Font, Marker, Plot Size, X-axis Angle
         row1_frame = tk.Frame(controls_frame)
         row1_frame.pack(fill=tk.X, pady=5)
         
@@ -476,6 +515,14 @@ class DataPlotterWindow:
         self.plot_height_var = tk.IntVar(value=4)
         tk.Spinbox(size_control_frame, from_=3, to=15, textvariable=self.plot_height_var, width=4).pack(side=tk.LEFT, padx=2)
         tk.Label(size_control_frame, text="inches", font=("Arial", 8)).pack(side=tk.LEFT, padx=2)
+        
+        # X-axis Tick Angle Control
+        xangle_control_frame = tk.Frame(row1_frame)
+        xangle_control_frame.pack(side=tk.LEFT, padx=15)
+        tk.Label(xangle_control_frame, text="X-Tick Angle:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
+        self.x_tick_angle_var = tk.IntVar(value=45)
+        tk.Spinbox(xangle_control_frame, from_=0, to=90, increment=5, textvariable=self.x_tick_angle_var, width=4).pack(side=tk.LEFT, padx=2)
+        tk.Label(xangle_control_frame, text="°", font=("Arial", 9)).pack(side=tk.LEFT)
         
         # Row 2: Legend Controls
         row2_frame = tk.Frame(controls_frame)
@@ -509,7 +556,7 @@ class DataPlotterWindow:
         row3_frame = tk.Frame(controls_frame)
         row3_frame.pack(fill=tk.X, pady=5)
         
-        # X-axis limits (using index-based for simplicity)
+        # X-axis limits
         x_limit_frame = tk.Frame(row3_frame)
         x_limit_frame.pack(side=tk.LEFT, padx=15)
         tk.Label(x_limit_frame, text="X-Axis (rows):", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
@@ -544,23 +591,51 @@ class DataPlotterWindow:
         
         # Button frame
         button_frame = tk.Frame(control_frame)
-        button_frame.pack(pady=10)
+        button_frame.pack(pady=20)
         
-        tk.Button(button_frame, text="Generate Plot", command=self.generate_plot, 
-                 bg="#27ae60", fg="white", font=("Arial", 11, "bold"), width=15).pack(side=tk.LEFT, padx=5)
-        tk.Button(button_frame, text="Save Plot", command=self.save_plot,
-                 bg="#3498db", fg="white", font=("Arial", 11, "bold"), width=15).pack(side=tk.LEFT, padx=5)
-        tk.Button(button_frame, text="Reset All", command=self.reset_all,
-                 bg="#f39c12", fg="white", font=("Arial", 11, "bold"), width=15).pack(side=tk.LEFT, padx=5)
-        tk.Button(button_frame, text="Close", command=self.window.destroy,
-                 bg="#e74c3c", fg="white", font=("Arial", 11, "bold"), width=15).pack(side=tk.LEFT, padx=5)
+        # Row 1 of buttons
+        button_row1 = tk.Frame(button_frame)
+        button_row1.pack(pady=5)
         
-        # Plot frame
-        self.plot_frame = tk.Frame(self.window)
-        self.plot_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        tk.Button(button_row1, text="Generate Plot", command=self.generate_plot, 
+                 bg="#27ae60", fg="white", font=("Arial", 11, "bold"), width=15, height=2).pack(side=tk.LEFT, padx=5)
+        tk.Button(button_row1, text="Save Plot", command=self.save_plot,
+                 bg="#3498db", fg="white", font=("Arial", 11, "bold"), width=15, height=2).pack(side=tk.LEFT, padx=5)
+        tk.Button(button_row1, text="Reset All", command=self.reset_all,
+                 bg="#f39c12", fg="white", font=("Arial", 11, "bold"), width=15, height=2).pack(side=tk.LEFT, padx=5)
+        
+        # Row 2 of buttons
+        button_row2 = tk.Frame(button_frame)
+        button_row2.pack(pady=5)
+        
+        tk.Button(button_row2, text="Save Configuration", command=self.save_configuration,
+                 bg="#9b59b6", fg="white", font=("Arial", 11, "bold"), width=15, height=2).pack(side=tk.LEFT, padx=5)
+        tk.Button(button_row2, text="Load Configuration", command=self.load_configuration,
+                 bg="#8e44ad", fg="white", font=("Arial", 11, "bold"), width=15, height=2).pack(side=tk.LEFT, padx=5)
+        tk.Button(button_row2, text="Close", command=self.window.destroy,
+                 bg="#e74c3c", fg="white", font=("Arial", 11, "bold"), width=15, height=2).pack(side=tk.LEFT, padx=5)
+        
+    def setup_plot_tab(self):
+        """Setup the plot preview tab"""
+        # Info label
+        info_frame = tk.Frame(self.plot_tab, bg="#ecf0f1", height=40)
+        info_frame.pack(fill=tk.X)
+        info_frame.pack_propagate(False)
+        
+        tk.Label(info_frame, text="Configure settings in the 'Controls & Settings' tab, then click 'Generate Plot' to view here", 
+                font=("Arial", 10), bg="#ecf0f1", fg="#34495e").pack(pady=10)
+        
+        # Plot frame with proper scaling
+        self.plot_frame = tk.Frame(self.plot_tab, bg="white")
+        self.plot_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         self.fig = None
         self.canvas = None
+        
+        # Initial placeholder
+        self.placeholder = tk.Label(self.plot_frame, text="No plot generated yet\n\nGo to Controls & Settings tab and click 'Generate Plot'", 
+                              font=("Arial", 14), fg="gray", bg="white")
+        self.placeholder.pack(expand=True)
     
     def on_legend_preset_change(self, event=None):
         """Update legend X,Y values when preset changes"""
@@ -583,6 +658,200 @@ class DataPlotterWindow:
             self.legend_x_var.set(x)
             self.legend_y_var.set(y)
     
+    def save_configuration(self):
+        """Save current plot configuration to a text file"""
+        filename = filedialog.asksaveasfilename(
+            title="Save Configuration As",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            # Get selected columns
+            left_cols = [col for col, var in self.left_vars if var.get()]
+            right_cols = [col for col, var in self.right_vars if var.get()]
+            
+            # Create configuration text
+            config_text = "=" * 70 + "\n"
+            config_text += "DATA PLOTTER CONFIGURATION\n"
+            config_text += f"Saved: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            config_text += "=" * 70 + "\n\n"
+            
+            config_text += "DATA SOURCE:\n"
+            config_text += "-" * 70 + "\n"
+            config_text += f"CSV File: {os.path.basename(self.csv_path)}\n"
+            config_text += f"Full Path: {self.csv_path}\n\n"
+            
+            config_text += "SELECTED COLUMNS:\n"
+            config_text += "-" * 70 + "\n"
+            config_text += f"Left Y-Axis (Temperature): {', '.join(left_cols) if left_cols else 'None'}\n"
+            config_text += f"Right Y-Axis (Capacity): {', '.join(right_cols) if right_cols else 'None'}\n\n"
+            
+            config_text += "PLOT APPEARANCE:\n"
+            config_text += "-" * 70 + "\n"
+            config_text += f"Font Size: {self.font_size_var.get()}\n"
+            config_text += f"Marker Size: {self.marker_size_var.get()}\n"
+            config_text += f"Plot Size: {self.plot_width_var.get()}\" × {self.plot_height_var.get()}\"\n"
+            config_text += f"X-Axis Tick Angle: {self.x_tick_angle_var.get()}°\n\n"
+            
+            config_text += "LEGEND SETTINGS:\n"
+            config_text += "-" * 70 + "\n"
+            config_text += f"Legend Preset: {self.legend_position_var.get()}\n"
+            config_text += f"Legend X Position: {self.legend_x_var.get()}\n"
+            config_text += f"Legend Y Position: {self.legend_y_var.get()}\n\n"
+            
+            config_text += "AXIS LIMITS:\n"
+            config_text += "-" * 70 + "\n"
+            config_text += f"X-Axis Min (rows): {self.x_min_var.get() if self.x_min_var.get() else 'Auto'}\n"
+            config_text += f"X-Axis Max (rows): {self.x_max_var.get() if self.x_max_var.get() else 'Auto'}\n"
+            config_text += f"Left Y-Axis Min: {self.y1_min_var.get() if self.y1_min_var.get() else 'Auto'}\n"
+            config_text += f"Left Y-Axis Max: {self.y1_max_var.get() if self.y1_max_var.get() else 'Auto'}\n"
+            config_text += f"Right Y-Axis Min: {self.y2_min_var.get() if self.y2_min_var.get() else 'Auto'}\n"
+            config_text += f"Right Y-Axis Max: {self.y2_max_var.get() if self.y2_max_var.get() else 'Auto'}\n\n"
+            
+            config_text += "=" * 70 + "\n"
+            config_text += "END OF CONFIGURATION\n"
+            config_text += "=" * 70 + "\n"
+            
+            # Save to file
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(config_text)
+            
+            messagebox.showinfo("Success", f"Configuration saved successfully to:\n{filename}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save configuration:\n{e}")
+    
+    def load_configuration(self):
+        """Load plot configuration from a text file"""
+        filename = filedialog.askopenfilename(
+            title="Load Configuration File",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                config_text = f.read()
+            
+            # Parse configuration file
+            config = {}
+            
+            # Extract values using regex
+            patterns = {
+                'left_cols': r'Left Y-Axis \(Temperature\): (.+)',
+                'right_cols': r'Right Y-Axis \(Capacity\): (.+)',
+                'font_size': r'Font Size: (\d+)',
+                'marker_size': r'Marker Size: (\d+)',
+                'plot_width': r'Plot Size: (\d+)" × (\d+)"',
+                'x_tick_angle': r'X-Axis Tick Angle: (\d+)°',
+                'legend_preset': r'Legend Preset: (.+)',
+                'legend_x': r'Legend X Position: (.+)',
+                'legend_y': r'Legend Y Position: (.+)',
+                'x_min': r'X-Axis Min \(rows\): (.+)',
+                'x_max': r'X-Axis Max \(rows\): (.+)',
+                'y1_min': r'Left Y-Axis Min: (.+)',
+                'y1_max': r'Left Y-Axis Max: (.+)',
+                'y2_min': r'Right Y-Axis Min: (.+)',
+                'y2_max': r'Right Y-Axis Max: (.+)',
+            }
+            
+            for key, pattern in patterns.items():
+                match = re.search(pattern, config_text)
+                if match:
+                    if key == 'plot_width':
+                        config['plot_width'] = match.group(1)
+                        config['plot_height'] = match.group(2)
+                    else:
+                        config[key] = match.group(1).strip()
+            
+            # Apply configuration
+            loaded_count = 0
+            
+            # Set column selections
+            if 'left_cols' in config and config['left_cols'] != 'None':
+                left_cols = [c.strip() for c in config['left_cols'].split(',')]
+                for col, var in self.left_vars:
+                    var.set(col in left_cols)
+                    if col in left_cols:
+                        loaded_count += 1
+            
+            if 'right_cols' in config and config['right_cols'] != 'None':
+                right_cols = [c.strip() for c in config['right_cols'].split(',')]
+                for col, var in self.right_vars:
+                    var.set(col in right_cols)
+                    if col in right_cols:
+                        loaded_count += 1
+            
+            # Set plot appearance
+            if 'font_size' in config:
+                self.font_size_var.set(int(config['font_size']))
+                loaded_count += 1
+            
+            if 'marker_size' in config:
+                self.marker_size_var.set(int(config['marker_size']))
+                loaded_count += 1
+            
+            if 'plot_width' in config:
+                self.plot_width_var.set(int(config['plot_width']))
+                loaded_count += 1
+            
+            if 'plot_height' in config:
+                self.plot_height_var.set(int(config['plot_height']))
+                loaded_count += 1
+            
+            if 'x_tick_angle' in config:
+                self.x_tick_angle_var.set(int(config['x_tick_angle']))
+                loaded_count += 1
+            
+            # Set legend settings
+            if 'legend_preset' in config:
+                self.legend_position_var.set(config['legend_preset'])
+                loaded_count += 1
+            
+            if 'legend_x' in config:
+                self.legend_x_var.set(config['legend_x'])
+                loaded_count += 1
+            
+            if 'legend_y' in config:
+                self.legend_y_var.set(config['legend_y'])
+                loaded_count += 1
+            
+            # Set axis limits
+            if 'x_min' in config:
+                self.x_min_var.set("" if config['x_min'] == 'Auto' else config['x_min'])
+                loaded_count += 1
+            
+            if 'x_max' in config:
+                self.x_max_var.set("" if config['x_max'] == 'Auto' else config['x_max'])
+                loaded_count += 1
+            
+            if 'y1_min' in config:
+                self.y1_min_var.set("" if config['y1_min'] == 'Auto' else config['y1_min'])
+                loaded_count += 1
+            
+            if 'y1_max' in config:
+                self.y1_max_var.set("" if config['y1_max'] == 'Auto' else config['y1_max'])
+                loaded_count += 1
+            
+            if 'y2_min' in config:
+                self.y2_min_var.set("" if config['y2_min'] == 'Auto' else config['y2_min'])
+                loaded_count += 1
+            
+            if 'y2_max' in config:
+                self.y2_max_var.set("" if config['y2_max'] == 'Auto' else config['y2_max'])
+                loaded_count += 1
+            
+            messagebox.showinfo("Success", f"Configuration loaded successfully!\n\n{loaded_count} settings applied.\n\nFrom: {os.path.basename(filename)}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load configuration:\n{e}")
+    
     def reset_all(self):
         """Reset all controls to defaults"""
         self.x_min_var.set("")
@@ -595,6 +864,7 @@ class DataPlotterWindow:
         self.marker_size_var.set(21)
         self.plot_width_var.set(6)
         self.plot_height_var.set(4)
+        self.x_tick_angle_var.set(45)
         self.legend_position_var.set("top")
         self.legend_x_var.set("0.5")
         self.legend_y_var.set("1.12")
@@ -613,12 +883,17 @@ class DataPlotterWindow:
         if self.canvas:
             self.canvas.get_tk_widget().destroy()
         
+        # Clear placeholder if exists
+        if hasattr(self, 'placeholder'):
+            self.placeholder.destroy()
+        
         # Get plot size from controls
         plot_width = self.plot_width_var.get()
         plot_height = self.plot_height_var.get()
         
-        # Create figure with specified size and DPI
-        self.fig, ax1 = plt.subplots(figsize=(plot_width, plot_height), dpi=300)
+        # Create figure with tight layout that fits in frame
+        self.fig = Figure(figsize=(plot_width, plot_height), dpi=100, tight_layout=True)
+        ax1 = self.fig.add_subplot(111)
         
         # Colors for different series
         temp_colors = ['#3498db', '#2ecc71', '#9b59b6', '#f39c12', '#1abc9c']
@@ -634,6 +909,9 @@ class DataPlotterWindow:
         tick_fontsize = base_font
         legend_fontsize = base_font * 0.9
         
+        # Get x-axis tick angle
+        x_tick_angle = self.x_tick_angle_var.get()
+        
         # Plot left Y-axis data (Temperature)
         for idx, col in enumerate(left_cols):
             color = temp_colors[idx % len(temp_colors)]
@@ -648,11 +926,11 @@ class DataPlotterWindow:
         ax1.tick_params(axis='x', labelsize=tick_fontsize)
         ax1.grid(True, alpha=0.3)
         
-        # Format x-axis
+        # Format x-axis with custom angle
         ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d/%Y %H:%M'))
-        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=x_tick_angle, ha='right')
         
-        # Apply X-axis limits (based on row index)
+        # Apply X-axis limits
         try:
             x_min = int(self.x_min_var.get()) if self.x_min_var.get() else None
             x_max = int(self.x_max_var.get()) if self.x_max_var.get() else None
@@ -663,12 +941,11 @@ class DataPlotterWindow:
                 if x_max is None:
                     x_max = len(self.df) - 1
                 
-                # Convert row indices to datetime
                 x_min_date = self.df['DateTime'].iloc[min(max(0, x_min), len(self.df)-1)]
                 x_max_date = self.df['DateTime'].iloc[min(max(0, x_max), len(self.df)-1)]
                 ax1.set_xlim(x_min_date, x_max_date)
         except ValueError:
-            pass  # Invalid input, use auto limits
+            pass
         
         # Apply Left Y-axis limits
         try:
@@ -683,7 +960,7 @@ class DataPlotterWindow:
                     y1_max = current_ylim[1]
                 ax1.set_ylim(y1_min, y1_max)
         except ValueError:
-            pass  # Invalid input, use auto limits
+            pass
         
         # Plot right Y-axis data (Capacity)
         ax2 = None
@@ -711,13 +988,13 @@ class DataPlotterWindow:
                         y2_max = current_ylim[1]
                     ax2.set_ylim(y2_min, y2_max)
             except ValueError:
-                pass  # Invalid input, use auto limits
+                pass
         
-        # Title
-        title = f"Temperature-Capacity Correlation - {os.path.basename(self.csv_path)}"
-        plt.title(title, fontsize=title_fontsize, fontweight='bold', pad=20)
+        # Title - MANUAL CHANGE: Split into two lines with \n
+        title = f"Temperature-Capacity Correlation \n {os.path.basename(self.csv_path)}"
+        ax1.set_title(title, fontsize=title_fontsize, fontweight='bold', pad=20)
         
-        # Get legend position (use custom X,Y values)
+        # Get legend position
         legend_preset = self.legend_position_var.get()
         
         try:
@@ -727,70 +1004,18 @@ class DataPlotterWindow:
             legend_x = 0.5
             legend_y = 1.12
         
-        # Combine legends with custom position
+        # Combine legends
         lines1, labels1 = ax1.get_legend_handles_labels()
         if right_cols and ax2:
             lines2, labels2 = ax2.get_legend_handles_labels()
-            
-            if legend_preset == "custom" or legend_preset not in ["bottom", "top", "right", "left"]:
-                # Use custom X,Y coordinates
-                ax1.legend(lines1 + lines2, labels1 + labels2, 
-                          loc='center', 
-                          bbox_to_anchor=(legend_x, legend_y),
-                          ncol=3,
-                          frameon=True, 
-                          shadow=True, 
-                          fontsize=legend_fontsize,
-                          fancybox=True)
-            else:
-                # Use preset position
-                if legend_preset == "bottom":
-                    ax1.legend(lines1 + lines2, labels1 + labels2, 
-                              loc='upper center', 
-                              bbox_to_anchor=(legend_x, legend_y),
-                              ncol=3,
-                              frameon=True, 
-                              shadow=True, 
-                              fontsize=legend_fontsize,
-                              fancybox=True)
-                    plt.subplots_adjust(bottom=0.20, top=0.93, left=0.10, right=0.90)
-                elif legend_preset == "top":
-                    ax1.legend(lines1 + lines2, labels1 + labels2, 
-                              loc='upper center', 
-                              bbox_to_anchor=(legend_x, legend_y),
-                              ncol=3,
-                              frameon=True, 
-                              shadow=True, 
-                              fontsize=legend_fontsize,
-                              fancybox=True)
-                    plt.subplots_adjust(bottom=0.12, top=0.85, left=0.10, right=0.90)
-                elif legend_preset == "right":
-                    ax1.legend(lines1 + lines2, labels1 + labels2, 
-                              loc='center left', 
-                              bbox_to_anchor=(legend_x, legend_y),
-                              frameon=True, 
-                              shadow=True, 
-                              fontsize=legend_fontsize,
-                              fancybox=True)
-                    plt.subplots_adjust(bottom=0.12, top=0.93, left=0.10, right=0.80)
-                elif legend_preset == "left":
-                    ax1.legend(lines1 + lines2, labels1 + labels2, 
-                              loc='center right', 
-                              bbox_to_anchor=(legend_x, legend_y),
-                              frameon=True, 
-                              shadow=True, 
-                              fontsize=legend_fontsize,
-                              fancybox=True)
-                    plt.subplots_adjust(bottom=0.12, top=0.93, left=0.25, right=0.90)
-                else:
-                    # For built-in positions
-                    ax1.legend(lines1 + lines2, labels1 + labels2, 
-                              loc=legend_preset,
-                              frameon=True, 
-                              shadow=True, 
-                              fontsize=legend_fontsize,
-                              fancybox=True)
-                    plt.subplots_adjust(bottom=0.12, top=0.93, left=0.10, right=0.90)
+            ax1.legend(lines1 + lines2, labels1 + labels2, 
+                      loc='center', 
+                      bbox_to_anchor=(legend_x, legend_y),
+                      ncol=3,
+                      frameon=True, 
+                      shadow=True, 
+                      fontsize=legend_fontsize,
+                      fancybox=True)
         else:
             ax1.legend(loc='center', 
                       bbox_to_anchor=(legend_x, legend_y),
@@ -799,12 +1024,14 @@ class DataPlotterWindow:
                       shadow=True, 
                       fontsize=legend_fontsize,
                       fancybox=True)
-            plt.subplots_adjust(bottom=0.12, top=0.93, left=0.10, right=0.90)
         
-        # Embed in tkinter
+        # Embed in tkinter with proper scaling
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
         self.canvas.draw()
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Switch to plot tab to show the result
+        self.notebook.select(self.plot_tab)
         
     def save_plot(self):
         """Save the plot to file"""
@@ -824,7 +1051,6 @@ class DataPlotterWindow:
         )
         
         if filename:
-            # Save with current size at 300 DPI
             plot_width = self.plot_width_var.get()
             plot_height = self.plot_height_var.get()
             self.fig.savefig(filename, dpi=300, bbox_inches='tight')
@@ -835,20 +1061,21 @@ class TDMSMatcherGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("TDMS Data Matcher")
-        self.root.geometry("700x750")
-        self.root.resizable(False, False)
+        self.root.geometry("750x850")
+        self.root.resizable(True, True)
         
         # Variables
         self.csv_path = tk.StringVar()
         self.tdms_folder = tk.StringVar()
-        self.tdms_channel = tk.StringVar()
-        self.new_column_name = tk.StringVar(value="Inlet Temperature (degC)")
         self.tolerance = tk.IntVar(value=1)
         self.output_path = tk.StringVar()
         
         self.available_channels = []
         self.group_name = None
         self.matcher = None
+        
+        # Channel mappings list: [(tdms_channel, column_name), ...]
+        self.channel_mappings = []
         
         self.setup_ui()
         
@@ -868,9 +1095,23 @@ class TDMSMatcherGUI:
         )
         title_label.pack(pady=15)
         
-        # Main content frame
-        main_frame = tk.Frame(self.root, padx=20, pady=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        # Main content frame with scrollbar
+        main_canvas = tk.Canvas(self.root)
+        scrollbar = tk.Scrollbar(self.root, orient="vertical", command=main_canvas.yview)
+        scrollable_main_frame = tk.Frame(main_canvas)
+        
+        scrollable_main_frame.bind(
+            "<Configure>",
+            lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+        )
+        
+        main_canvas.create_window((0, 0), window=scrollable_main_frame, anchor="nw")
+        main_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        main_canvas.pack(side="left", fill="both", expand=True, padx=20, pady=20)
+        scrollbar.pack(side="right", fill="y")
+        
+        main_frame = scrollable_main_frame
         
         # CSV File Selection
         csv_frame = tk.LabelFrame(main_frame, text="1. Select Summary CSV File", font=("Arial", 10, "bold"), padx=10, pady=10)
@@ -902,32 +1143,30 @@ class TDMSMatcherGUI:
         self.load_channels_button.pack(pady=(10, 0))
         
         # Configuration Frame
-        config_frame = tk.LabelFrame(main_frame, text="3. Configuration", font=("Arial", 10, "bold"), padx=10, pady=10)
+        config_frame = tk.LabelFrame(main_frame, text="3. Configuration - TDMS Channels", font=("Arial", 10, "bold"), padx=10, pady=10)
         config_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # TDMS Channel Dropdown
-        tk.Label(config_frame, text="TDMS Channel:", anchor='w').grid(row=0, column=0, sticky='w', pady=5)
-        channel_frame = tk.Frame(config_frame)
-        channel_frame.grid(row=0, column=1, sticky='w', padx=10, pady=5)
+        # Channel mappings container
+        self.channel_container = tk.Frame(config_frame)
+        self.channel_container.pack(fill=tk.X, pady=5)
         
-        self.channel_dropdown = ttk.Combobox(
-            channel_frame, 
-            textvariable=self.tdms_channel, 
-            width=45,
-            state='readonly'
+        # Add channel button
+        add_channel_btn = tk.Button(
+            config_frame,
+            text="➕ Add TDMS Channel",
+            command=self.add_channel_row,
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 9, "bold"),
+            state=tk.DISABLED
         )
-        self.channel_dropdown.pack(side=tk.LEFT)
-        self.channel_dropdown['values'] = ["Select TDMS folder first..."]
-        self.channel_dropdown.current(0)
+        add_channel_btn.pack(pady=5)
+        self.add_channel_button = add_channel_btn
         
-        # New Column Name
-        tk.Label(config_frame, text="New Column Name:", anchor='w').grid(row=1, column=0, sticky='w', pady=5)
-        tk.Entry(config_frame, textvariable=self.new_column_name, width=47).grid(row=1, column=1, sticky='w', padx=10, pady=5)
-        
-        # Tolerance
-        tk.Label(config_frame, text="Tolerance (seconds):", anchor='w').grid(row=2, column=0, sticky='w', pady=5)
+        # Tolerance (Universal)
         tolerance_frame = tk.Frame(config_frame)
-        tolerance_frame.grid(row=2, column=1, sticky='w', padx=10, pady=5)
+        tolerance_frame.pack(fill=tk.X, pady=10)
+        tk.Label(tolerance_frame, text="Tolerance (seconds) - applies to all channels:", anchor='w', font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
         tk.Spinbox(tolerance_frame, from_=1, to=300, textvariable=self.tolerance, width=10).pack(side=tk.LEFT)
         tk.Label(tolerance_frame, text="(±seconds for matching)").pack(side=tk.LEFT, padx=5)
         
@@ -986,10 +1225,90 @@ class TDMSMatcherGUI:
         self.status_text = tk.Text(status_frame, height=10, wrap=tk.WORD)
         self.status_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        scrollbar = tk.Scrollbar(self.status_text)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.status_text.config(yscrollcommand=scrollbar.set)
-        scrollbar.config(command=self.status_text.yview)
+        status_scrollbar = tk.Scrollbar(self.status_text)
+        status_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.status_text.config(yscrollcommand=status_scrollbar.set)
+        status_scrollbar.config(command=self.status_text.yview)
+    
+    def add_channel_row(self):
+        """Add a new channel mapping row"""
+        row_frame = tk.Frame(self.channel_container, relief=tk.RIDGE, borderwidth=2, padx=5, pady=5)
+        row_frame.pack(fill=tk.X, pady=5)
+        
+        # Row number label
+        row_num = len(self.channel_mappings) + 1
+        tk.Label(row_frame, text=f"#{row_num}", font=("Arial", 9, "bold"), width=3).grid(row=0, column=0, padx=5)
+        
+        # TDMS Channel dropdown
+        tk.Label(row_frame, text="TDMS Channel:", anchor='w').grid(row=0, column=1, sticky='w', padx=5)
+        channel_var = tk.StringVar()
+        channel_dropdown = ttk.Combobox(
+            row_frame, 
+            textvariable=channel_var, 
+            width=35,
+            state='readonly',
+            values=self.available_channels
+        )
+        channel_dropdown.grid(row=0, column=2, sticky='w', padx=5)
+        
+        # Auto-set default if available
+        if self.available_channels:
+            default_channel = None
+            for ch in self.available_channels:
+                if 'T19' in ch or '9211_6 TC2' in ch:
+                    default_channel = ch
+                    break
+            if default_channel:
+                channel_dropdown.set(default_channel)
+            else:
+                channel_dropdown.current(0)
+        
+        # New Column Name
+        tk.Label(row_frame, text="New Column Name:", anchor='w').grid(row=0, column=3, sticky='w', padx=5)
+        column_name_var = tk.StringVar(value=f"TDMS_Channel_{row_num}")
+        tk.Entry(row_frame, textvariable=column_name_var, width=25).grid(row=0, column=4, sticky='w', padx=5)
+        
+        # Remove button
+        remove_btn = tk.Button(
+            row_frame,
+            text="✕",
+            command=lambda: self.remove_channel_row(row_frame, channel_var, column_name_var),
+            bg="#e74c3c",
+            fg="white",
+            font=("Arial", 9, "bold"),
+            width=3
+        )
+        remove_btn.grid(row=0, column=5, padx=5)
+        
+        # Store the mapping
+        self.channel_mappings.append({
+            'frame': row_frame,
+            'channel_var': channel_var,
+            'column_name_var': column_name_var
+        })
+        
+        self.log_status(f"Added channel mapping row #{row_num}")
+    
+    def remove_channel_row(self, frame, channel_var, column_name_var):
+        """Remove a channel mapping row"""
+        # Find and remove from list
+        for mapping in self.channel_mappings:
+            if mapping['frame'] == frame:
+                self.channel_mappings.remove(mapping)
+                break
+        
+        # Destroy the frame
+        frame.destroy()
+        
+        # Renumber remaining rows
+        for idx, mapping in enumerate(self.channel_mappings):
+            # Update row number label
+            for widget in mapping['frame'].winfo_children():
+                if isinstance(widget, tk.Label) and widget.cget("text").startswith("#"):
+                    widget.config(text=f"#{idx+1}")
+                    break
+        
+        self.log_status(f"Removed channel mapping row")
         
     def browse_csv(self):
         """Open file dialog to select CSV file"""
@@ -1043,28 +1362,16 @@ class TDMSMatcherGUI:
                 messagebox.showerror("Error", "No data group with channels found in TDMS file!")
                 return
             
-            self.available_channels = [channel.name for channel in data_group.channels()]
-            display_channels = [ch for ch in self.available_channels if 'Date/Time' not in ch]
+            all_channels = [channel.name for channel in data_group.channels()]
+            self.available_channels = [ch for ch in all_channels if 'Date/Time' not in ch]
             
-            if display_channels:
-                self.channel_dropdown['values'] = display_channels
+            if self.available_channels:
+                self.add_channel_button.config(state=tk.NORMAL)
                 
-                default_channel = None
-                for ch in display_channels:
-                    if 'T19' in ch or '9211_6 TC2' in ch:
-                        default_channel = ch
-                        break
-                
-                if default_channel:
-                    self.channel_dropdown.set(default_channel)
-                    self.new_column_name.set("Inlet Temperature (degC)")
-                else:
-                    self.channel_dropdown.current(0)
-                
-                self.log_status(f"✓ Found {len(display_channels)} data channels in group '{self.group_name}'")
+                self.log_status(f"✓ Found {len(self.available_channels)} data channels in group '{self.group_name}'")
                 messagebox.showinfo(
                     "Success", 
-                    f"Loaded {len(display_channels)} channels from TDMS file!\n\nGroup: '{self.group_name}'\n\nSelect a channel from the dropdown."
+                    f"Loaded {len(self.available_channels)} channels from TDMS file!\n\nGroup: '{self.group_name}'\n\nClick '➕ Add TDMS Channel' to add channel mappings."
                 )
             else:
                 messagebox.showerror("Error", "No data channels found in TDMS file!")
@@ -1108,13 +1415,22 @@ class TDMSMatcherGUI:
             messagebox.showerror("Error", "TDMS folder does not exist!")
             return False
         
-        if not self.tdms_channel.get() or self.tdms_channel.get() == "Select TDMS folder first...":
-            messagebox.showerror("Error", "Please select a TDMS channel!\n\nClick 'Load Available Channels' first.")
+        if not self.channel_mappings:
+            messagebox.showerror("Error", "Please add at least one TDMS channel mapping!\n\nClick '➕ Add TDMS Channel' first.")
             return False
         
-        if not self.new_column_name.get():
-            messagebox.showerror("Error", "Please enter a new column name!")
-            return False
+        # Validate each mapping
+        for idx, mapping in enumerate(self.channel_mappings):
+            channel = mapping['channel_var'].get()
+            col_name = mapping['column_name_var'].get()
+            
+            if not channel:
+                messagebox.showerror("Error", f"Channel mapping #{idx+1}: Please select a TDMS channel!")
+                return False
+            
+            if not col_name:
+                messagebox.showerror("Error", f"Channel mapping #{idx+1}: Please enter a column name!")
+                return False
         
         return True
     
@@ -1136,12 +1452,19 @@ class TDMSMatcherGUI:
             
             self.matcher.group_name = self.group_name
             
-            self.log_status(f"Channel: {self.tdms_channel.get()}")
+            # Prepare channel mappings
+            mappings = [
+                (mapping['channel_var'].get(), mapping['column_name_var'].get())
+                for mapping in self.channel_mappings
+            ]
+            
+            self.log_status(f"Processing {len(mappings)} TDMS channels:")
+            for tdms_ch, col_name in mappings:
+                self.log_status(f"  • {tdms_ch} → {col_name}")
             self.log_status(f"Tolerance: ±{self.tolerance.get()} seconds")
             
-            updated_df = self.matcher.match_and_add_tdms_data(
-                tdms_channel_name=self.tdms_channel.get(),
-                new_column_name=self.new_column_name.get(),
+            updated_df = self.matcher.match_and_add_multiple_tdms_data(
+                channel_mappings=mappings,
                 tolerance_seconds=self.tolerance.get()
             )
             
@@ -1160,7 +1483,7 @@ class TDMSMatcherGUI:
             final_path = output if output else self.csv_path.get()
             messagebox.showinfo(
                 "Success", 
-                f"Data processed successfully!\n\nOutput saved to:\n{final_path}\n\nYou can now click 'Plot Data' to visualize!"
+                f"Data processed successfully!\n\n{len(mappings)} TDMS channels added to CSV.\n\nOutput saved to:\n{final_path}\n\nYou can now click 'Plot Data' to visualize!"
             )
             
             self.plot_button.config(state=tk.NORMAL)
