@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import io
 import os
 from pathlib import Path
+import matplotlib.dates as mdates
 
 # Excel date conversion constant (Excel epoch: January 1, 1900)
 EXCEL_EPOCH = datetime(1899, 12, 30)  # Note: Excel incorrectly treats 1900 as a leap year
@@ -594,7 +595,7 @@ class CSVPlotter:
 
     def convert_excel_date_column(self, df):
         """
-        Convert Excel date/time format columns to readable datetime format.
+        Convert Excel date/time format columns to datetime objects for fast plotting.
         Looks for columns with 'date' or 'time' in name and Excel-like numeric values.
         """
         for col in df.columns:
@@ -604,13 +605,12 @@ class CSVPlotter:
                 try:
                     # Check if the column contains numeric values (Excel date format)
                     if pd.api.types.is_numeric_dtype(df[col]):
-                        # Convert Excel date to datetime
+                        # Convert Excel date to datetime objects (keep as datetime, not string)
                         # Excel stores dates as days since December 30, 1899
                         df[col + '_Converted'] = pd.to_datetime(
                             EXCEL_EPOCH + pd.to_timedelta(df[col], 'D')
                         )
-                        # Format as string in YYYY/MM/DD - HH:MM:SS format
-                        df[col + '_Converted'] = df[col + '_Converted'].dt.strftime('%Y/%m/%d - %H:%M:%S')
+                        # Keep as datetime64 for fast plotting, don't convert to string
                 except Exception as e:
                     # If conversion fails, skip this column
                     print(f"Could not convert column {col}: {e}")
@@ -1306,10 +1306,20 @@ class CSVPlotter:
                     idx = np.linspace(0, n-1, num=min(n, max_pts), dtype=int)
                     x_arr = self.df[self.x_combo.get()].values[idx]
                     y_arr = self.df[col_name].values[idx].astype(float)
+                    
+                    # Convert datetime64 to matplotlib date format for fast plotting
+                    if pd.api.types.is_datetime64_any_dtype(x_arr):
+                        x_arr = mdates.date2num(pd.to_datetime(x_arr))
+                    
                     return x_arr, y_arr
                 else:
                     x_arr = self.df[self.x_combo.get()].values
                     y_arr = self.df[col_name].values.astype(float)
+                    
+                    # Convert datetime64 to matplotlib date format for fast plotting
+                    if pd.api.types.is_datetime64_any_dtype(x_arr):
+                        x_arr = mdates.date2num(pd.to_datetime(x_arr))
+                    
                     return x_arr, y_arr
             except Exception:
                 return np.array([]), np.array([])
@@ -1490,10 +1500,12 @@ class CSVPlotter:
             self.ax.set_title(self.title_entry.get(), fontsize=fs)
             self.ax.set_xlabel(self.xlabel_entry.get() or x_col, fontsize=fs)
             
-            # Rotate x-axis labels if using converted datetime format
+            # Format x-axis if using converted datetime format
             if x_col.endswith('_Converted'):
-                self.ax.tick_params(axis='x', rotation=45)
-                self.fig.tight_layout()
+                # Use matplotlib date formatter for better performance
+                self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y/%m/%d\n%H:%M:%S'))
+                self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+                self.fig.autofmt_xdate(rotation=45)
             self.ax.set_ylabel(self.ylabel_entry.get() or ", ".join(labels), fontsize=fs)
             self.ax.tick_params(axis="both", labelsize=fs)
             if ax2:
@@ -1898,13 +1910,18 @@ class CSVPlotter:
             global_lw = 1.0
 
         # Plot left axis
+        # Prepare X-axis data once
+        x_data = self.df[x_col].values
+        if pd.api.types.is_datetime64_any_dtype(x_data):
+            x_data = mdates.date2num(pd.to_datetime(x_data))
+        
         for y_col, row in zip(y_cols, self.line_properties_frames):
             try:
                 marker = None if (row.marker.get() == "None") else row.marker.get()
                 ydata = self.df[y_col].values.astype(float)
                 mcolor = getattr(row, "marker_color", "") or row.line_color
                 ax_save.plot(
-                    self.df[x_col].values, ydata,
+                    x_data, ydata,
                     linestyle=row.line_style.get(),
                     linewidth=global_lw,
                     color=row.line_color,
@@ -1934,7 +1951,7 @@ class CSVPlotter:
                     ydata = self.df[y_col].values.astype(float)
                     mcolor = getattr(row, "marker_color", "") or row.line_color
                     ax2_save.plot(
-                        self.df[x_col].values, ydata,
+                        x_data, ydata,
                         linestyle=row.line_style.get(),
                         linewidth=global_lw,
                         color=row.line_color,
@@ -1975,7 +1992,7 @@ class CSVPlotter:
                     ydata = self.df[y_col].values.astype(float)
                     mcolor = getattr(row, "marker_color", "") or row.line_color
                     ax3_save.plot(
-                        self.df[x_col].values, ydata,
+                        x_data, ydata,
                         linestyle=row.line_style.get(),
                         linewidth=global_lw,
                         color=row.line_color,
@@ -2060,9 +2077,12 @@ class CSVPlotter:
             ax_save.set_title(self.title_entry.get(), fontsize=fs)
             ax_save.set_xlabel(self.xlabel_entry.get() or x_col, fontsize=fs)
             
-            # Rotate x-axis labels if using converted datetime format
+            # Format x-axis if using converted datetime format
             if x_col.endswith('_Converted'):
-                ax_save.tick_params(axis='x', rotation=45)
+                # Use matplotlib date formatter for better performance
+                ax_save.xaxis.set_major_formatter(mdates.DateFormatter('%Y/%m/%d\n%H:%M:%S'))
+                ax_save.xaxis.set_major_locator(mdates.AutoDateLocator())
+                fig_save.autofmt_xdate(rotation=45)
                 fig_save.tight_layout()
             ax_save.set_ylabel(
                 self.ylabel_entry.get() or ", ".join([r._linked_label_var.get() for r in self.line_properties_frames]),
