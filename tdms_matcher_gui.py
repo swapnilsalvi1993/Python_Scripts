@@ -323,7 +323,7 @@ class TDMSMatcher:
                 )
                 
                 if matched_row is not None:
-                    value = matched_row[tdms_channel_name]
+                    value = matched_row[tdms_channel_name]  # ✅ FIXED: Use tdms_channel_name here
                     matched_values.append(value)
                     match_time_diffs.append(time_diff)
                     match_count += 1
@@ -335,6 +335,7 @@ class TDMSMatcher:
                     print(f"Row {idx+1}: {target_dt} → No match (closest: {time_diff:.1f}s away)")
             
             # Add new columns to summary DataFrame
+            # ✅ FIXED: Use new_column_name (not tdms_channel_name) for the CSV column header
             self.summary_df[new_column_name] = matched_values
             self.summary_df[f'{new_column_name}_TimeDiff_s'] = match_time_diffs
             
@@ -350,7 +351,7 @@ class TDMSMatcher:
             print(f"{'='*60}\n")
         
         return self.summary_df
-    
+        
     def save_updated_csv(self, output_path=None):
         """
         Save the updated summary CSV with new TDMS data
