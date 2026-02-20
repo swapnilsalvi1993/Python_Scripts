@@ -44,14 +44,6 @@ class ThermocopleDAQGUI:
         self.csv_file = None
         self.csv_writer = None
         
-        # Display update throttling
-        self.last_display_update = time.time()
-        self.display_update_interval = 0.5  # Update display every 0.5 seconds
-        
-        # TDMS buffering
-        self.tdms_buffer = []
-        self.tdms_buffer_size = 10  # Write every 10 samples
-        
         # Acquisition parameters
         self.acquisition_rate = 1.0  # Hz
         self.file_rotation_interval = 12 * 3600  # seconds
@@ -60,16 +52,62 @@ class ThermocopleDAQGUI:
         self.colors = ['red', 'blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'cyan', 'magenta']
         self.markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
         
-        # Channel configuration lists (will be populated based on num_channels)
+        # Multiple module support
+        self.modules = []  # List of module configurations
+        self.total_channels = 0
+        
+        # Channel configuration lists (will be populated based on total channels across all modules)
         self.channel_selection_vars = []
         self.channel_label_vars = []
         self.channel_style_vars = []
         self.channel_color_vars = []
+        self.channel_yaxis_vars = []
         self.channel_frames = []
-        self.temp_display_labels = []  # NEW: Store temp display label widgets
+        self.temp_display_labels = []
+        self.channel_name_entries = []
+        
+        # TDMS buffering
+        self.tdms_buffer = []
+        self.tdms_buffer_size = 10
+        
+        # Display update throttling
+        self.last_display_update = time.time()
+        self.display_update_interval = 0.5
+        
+        # Plot zoom state tracking - NEW
+        self.plot_xlim = None
+        self.plot_ylim_left = None
+        self.plot_ylim_right = None
+        self.user_zoomed = False
+        self._updating_plot = False
+        
+        # Initialize GUI variables (MUST be before create_widgets)
+        self.time_window_var = tk.StringVar(value="1 hour")
+        self.tc_type_var = tk.StringVar(value="K")
+        self.temp_units_var = tk.StringVar(value="Celsius")
+        self.experiment_name_var = tk.StringVar(value="TC_Experiment")
+        self.data_path_var = tk.StringVar(value=os.getcwd())
+        self.config_path_var = tk.StringVar(value=os.getcwd())
+        self.acq_rate_var = tk.StringVar(value="1 Hz")
+        self.csv_logging_var = tk.BooleanVar(value=False)
+        
+        # Plot customization variables
+        self.plot_title_var = tk.StringVar(value="Thermocouple Temperature vs Time")
+        self.left_yaxis_title_var = tk.StringVar(value="Temperature (°C)")
+        self.right_yaxis_title_var = tk.StringVar(value="Temperature (°C)")
+        self.x_axis_auto_var = tk.BooleanVar(value=True)
+        self.left_y_auto_var = tk.BooleanVar(value=True)
+        self.left_y_min_var = tk.StringVar(value="0")
+        self.left_y_max_var = tk.StringVar(value="100")
+        self.right_y_auto_var = tk.BooleanVar(value=True)
+        self.right_y_min_var = tk.StringVar(value="0")
+        self.right_y_max_var = tk.StringVar(value="100")
         
         # Create GUI
         self.create_widgets()
+        
+        # Handle window close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
     def create_widgets(self):
         # Main container with notebook (tabs)
@@ -119,181 +157,149 @@ class ThermocopleDAQGUI:
         # Store col1_frame to disable all its children
         self.col1_frame = col1_frame
         
-        # Make column 1 scrollable
-        canvas_col1 = tk.Canvas(col1_frame, width=340)
-        scrollbar_col1 = ttk.Scrollbar(col1_frame, orient="vertical", command=canvas_col1.yview)
-        scrollable_col1 = ttk.Frame(canvas_col1)
+        # === Module Configuration (NEW - Scrollable) ===
+        module_config_frame = ttk.LabelFrame(col1_frame, text="Module Configuration", padding="10")
+        module_config_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        scrollable_col1.bind(
+        # Add/Apply buttons at top
+        module_button_frame = ttk.Frame(module_config_frame)
+        module_button_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Button(module_button_frame, text="➕ Add Module", 
+                  command=lambda: self.add_module_config(log=True), width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(module_button_frame, text="✓ Apply Configuration", 
+                  command=self.apply_all_modules, width=20).pack(side=tk.LEFT, padx=5)
+        
+        # Scrollable frame for modules
+        module_canvas = tk.Canvas(module_config_frame, height=250)
+        module_scrollbar = ttk.Scrollbar(module_config_frame, orient="vertical", command=module_canvas.yview)
+        self.modules_container = ttk.Frame(module_canvas)
+        
+        self.modules_container.bind(
             "<Configure>",
-            lambda e: canvas_col1.configure(scrollregion=canvas_col1.bbox("all"))
+            lambda e: module_canvas.configure(scrollregion=module_canvas.bbox("all"))
         )
         
-        canvas_col1.create_window((0, 0), window=scrollable_col1, anchor="nw")
-        canvas_col1.configure(yscrollcommand=scrollbar_col1.set)
+        module_canvas.create_window((0, 0), window=self.modules_container, anchor="nw")
+        module_canvas.configure(yscrollcommand=module_scrollbar.set)
         
-        canvas_col1.pack(side="left", fill="both", expand=True)
-        scrollbar_col1.pack(side="right", fill="y")
+        module_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        module_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        row = 0
+        # Add first module by default (without logging)
+        self.add_module_config(log=False)
         
-        # ===== Configuration Save/Load =====
-        config_frame = ttk.LabelFrame(scrollable_col1, text="Configuration Management", padding="10")
-        config_frame.grid(row=row, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        row += 1
-        
-        # Config folder path
-        ttk.Label(config_frame, text="Config Folder:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        
-        path_frame = ttk.Frame(config_frame)
-        path_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=5)
-        
-        self.config_path_var = tk.StringVar(value=os.getcwd())
-        config_path_entry = ttk.Entry(path_frame, textvariable=self.config_path_var, width=20)
-        config_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        
-        ttk.Button(path_frame, text="Browse", command=self.browse_config_folder, width=8).pack(side=tk.LEFT)
-        
-        # Save/Load buttons
-        button_frame = ttk.Frame(config_frame)
-        button_frame.grid(row=2, column=0, pady=5)
-        
-        ttk.Button(button_frame, text="Save Configuration", 
-                  command=self.save_configuration, width=15).pack(side=tk.LEFT, padx=2)
-        ttk.Button(button_frame, text="Load Configuration", 
-                  command=self.load_configuration, width=15).pack(side=tk.LEFT, padx=2)
-        
-        # ===== DAQ Hardware Configuration =====
-        daq_config_frame = ttk.LabelFrame(scrollable_col1, text="DAQ Hardware Configuration", padding="10")
-        daq_config_frame.grid(row=row, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        row += 1
-        
-        # Device Name
-        ttk.Label(daq_config_frame, text="Device Name:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.device_name_var = tk.StringVar(value="cDAQ2Mod1")
-        ttk.Entry(daq_config_frame, textvariable=self.device_name_var, width=25).grid(row=0, column=1, pady=5, padx=5)
-        ttk.Label(daq_config_frame, text="(e.g., cDAQ1Mod1, Dev1)", font=("Arial", 8), foreground="gray").grid(row=1, column=1, sticky=tk.W, padx=5)
-        
-        # Number of Channels
-        ttk.Label(daq_config_frame, text="Number of Channels:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.num_channels_var = tk.IntVar(value=4)
-        num_channels_spinbox = ttk.Spinbox(daq_config_frame, from_=1, to=32, textvariable=self.num_channels_var, width=23)
-        num_channels_spinbox.grid(row=2, column=1, pady=5, padx=5)
-        
-        # Starting Channel
-        ttk.Label(daq_config_frame, text="Starting Channel:").grid(row=3, column=0, sticky=tk.W, pady=5)
-        self.start_channel_var = tk.IntVar(value=0)
-        start_channel_spinbox = ttk.Spinbox(daq_config_frame, from_=0, to=31, textvariable=self.start_channel_var, width=23)
-        start_channel_spinbox.grid(row=3, column=1, pady=5, padx=5)
-        ttk.Label(daq_config_frame, text="(ai0, ai1, ai2, ...)", font=("Arial", 8), foreground="gray").grid(row=4, column=1, sticky=tk.W, padx=5)
+        # === DAQ Settings (Thermocouple Type & Temperature Units) ===
+        daq_settings_frame = ttk.LabelFrame(col1_frame, text="DAQ Settings", padding="10")
+        daq_settings_frame.pack(fill=tk.X, pady=(0, 10))
         
         # Thermocouple Type
-        ttk.Label(daq_config_frame, text="Thermocouple Type:").grid(row=5, column=0, sticky=tk.W, pady=5)
+        ttk.Label(daq_settings_frame, text="Thermocouple Type:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.tc_type_var = tk.StringVar(value="K")
-        tc_type_combo = ttk.Combobox(daq_config_frame, textvariable=self.tc_type_var,
-                                     values=['B', 'E', 'J', 'K', 'N', 'R', 'S', 'T'],
+        tc_type_combo = ttk.Combobox(daq_settings_frame, textvariable=self.tc_type_var,
+                                     values=['J', 'K', 'N', 'R', 'S', 'T', 'B', 'E'],
                                      state="readonly", width=22)
-        tc_type_combo.grid(row=5, column=1, pady=5, padx=5)
+        tc_type_combo.grid(row=0, column=1, pady=5, padx=5)
         
         # Temperature Units
-        ttk.Label(daq_config_frame, text="Temperature Units:").grid(row=6, column=0, sticky=tk.W, pady=5)
+        ttk.Label(daq_settings_frame, text="Temperature Units:").grid(row=1, column=0, sticky=tk.W, pady=5)
         self.temp_units_var = tk.StringVar(value="Celsius")
-        temp_units_combo = ttk.Combobox(daq_config_frame, textvariable=self.temp_units_var,
-                                       values=['Celsius', 'Fahrenheit', 'Kelvin'],
-                                       state="readonly", width=22)
-        temp_units_combo.grid(row=6, column=1, pady=5, padx=5)
+        temp_units_combo = ttk.Combobox(daq_settings_frame, textvariable=self.temp_units_var,
+                                        values=['Celsius', 'Fahrenheit'],
+                                        state="readonly", width=22)
+        temp_units_combo.grid(row=1, column=1, pady=5, padx=5)
         
-        # Apply Configuration Button
-        apply_button = ttk.Button(daq_config_frame, text="Apply DAQ Configuration", 
-                                 command=self.apply_daq_config, width=28)
-        apply_button.grid(row=7, column=0, columnspan=2, pady=10)
-        
-        # ===== Experiment Configuration =====
-        exp_config_frame = ttk.LabelFrame(scrollable_col1, text="Experiment Configuration", padding="10")
-        exp_config_frame.grid(row=row, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        row += 1
+        # === Experiment Configuration ===
+        exp_config_frame = ttk.LabelFrame(col1_frame, text="Experiment Configuration", padding="10")
+        exp_config_frame.pack(fill=tk.X, pady=(0, 10))
         
         # Experiment Name
         ttk.Label(exp_config_frame, text="Experiment Name:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.experiment_name_var = tk.StringVar(value="TC_Experiment")
-        ttk.Entry(exp_config_frame, textvariable=self.experiment_name_var, width=25).grid(row=0, column=1, pady=5, padx=5)
+        ttk.Entry(exp_config_frame, textvariable=self.experiment_name_var, width=24).grid(row=0, column=1, pady=5, padx=5)
         
-        # Data Save Folder
-        ttk.Label(exp_config_frame, text="Data Save Folder:").grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=5)
-        
-        data_path_frame = ttk.Frame(exp_config_frame)
-        data_path_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        # Data Save Path
+        ttk.Label(exp_config_frame, text="Data Path:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        path_frame = ttk.Frame(exp_config_frame)
+        path_frame.grid(row=1, column=1, pady=5, padx=5)
         
         self.data_path_var = tk.StringVar(value=os.getcwd())
-        data_path_entry = ttk.Entry(data_path_frame, textvariable=self.data_path_var, width=20)
-        data_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        
-        ttk.Button(data_path_frame, text="Browse", command=self.browse_data_folder, width=8).pack(side=tk.LEFT)
+        ttk.Entry(path_frame, textvariable=self.data_path_var, width=16).pack(side=tk.LEFT)
+        ttk.Button(path_frame, text="Browse", command=self.browse_data_path, width=7).pack(side=tk.LEFT, padx=(5, 0))
         
         # Acquisition Rate
-        ttk.Label(exp_config_frame, text="Acquisition Rate:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Label(exp_config_frame, text="Acquisition Rate:").grid(row=2, column=0, sticky=tk.W, pady=5)
         self.acq_rate_var = tk.StringVar(value="1 Hz")
-        acq_rate_dropdown = ttk.Combobox(exp_config_frame, textvariable=self.acq_rate_var, 
-                                          values=["0.1 Hz", "1 Hz", "2 Hz", "5 Hz", "10 Hz"],
-                                          state="readonly", width=22)
-        acq_rate_dropdown.grid(row=3, column=1, pady=5, padx=5)
-        acq_rate_dropdown.bind("<<ComboboxSelected>>", self.update_acquisition_rate)
-        
-        # X-axis Range
-        ttk.Label(exp_config_frame, text="Plot Time Window:").grid(row=4, column=0, sticky=tk.W, pady=5)
-        self.time_window_var = tk.StringVar(value="1 hour")
-        time_window_dropdown = ttk.Combobox(exp_config_frame, textvariable=self.time_window_var,
-                                             values=["30 minutes", "1 hour", "6 hours", "1 day", 
-                                                    "7 days", "30 days"],
-                                             state="readonly", width=22)
-        time_window_dropdown.grid(row=4, column=1, pady=5, padx=5)
+        acq_rate_combo = ttk.Combobox(exp_config_frame, textvariable=self.acq_rate_var,
+                                      values=["0.1 Hz", "0.5 Hz", "1 Hz", "2 Hz", "5 Hz", "10 Hz"],
+                                      state="readonly", width=22)
+        acq_rate_combo.grid(row=2, column=1, pady=5, padx=5)
+        acq_rate_combo.bind("<<ComboboxSelected>>", self.update_acquisition_rate)
         
         # CSV Logging Option
         self.csv_logging_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(exp_config_frame, text="Enable CSV Logging", 
-                       variable=self.csv_logging_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=5)
+                       variable=self.csv_logging_var).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=5)
+        
+        # === File Management ===
+        file_mgmt_frame = ttk.LabelFrame(col1_frame, text="Configuration File Management", padding="10")
+        file_mgmt_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Config Path
+        ttk.Label(file_mgmt_frame, text="Config Path:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        config_path_frame = ttk.Frame(file_mgmt_frame)
+        config_path_frame.grid(row=0, column=1, pady=5, padx=5)
+        
+        self.config_path_var = tk.StringVar(value=os.getcwd())
+        ttk.Entry(config_path_frame, textvariable=self.config_path_var, width=16).pack(side=tk.LEFT)
+        ttk.Button(config_path_frame, text="Browse", command=self.browse_config_path, width=7).pack(side=tk.LEFT, padx=(5, 0))
+        
+        # Save/Load Buttons
+        button_frame = ttk.Frame(file_mgmt_frame)
+        button_frame.grid(row=1, column=0, columnspan=2, pady=(10, 0))
+        
+        ttk.Button(button_frame, text="Save Configuration", 
+                  command=self.save_configuration, width=20).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Load Configuration", 
+                  command=self.load_configuration, width=20).pack(side=tk.LEFT, padx=5)
         
         # ===== COLUMN 2: Channel Configuration =====
-        col2_frame = ttk.LabelFrame(self.setup_tab, text="Channel Configuration", padding="10")
+        col2_frame = ttk.Frame(self.setup_tab)
         col2_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
         
-        # Make column 2 scrollable
-        canvas_col2 = tk.Canvas(col2_frame, width=340)
-        scrollbar_col2 = ttk.Scrollbar(col2_frame, orient="vertical", command=canvas_col2.yview)
-        self.channels_container = ttk.Frame(canvas_col2)
+        channels_frame = ttk.LabelFrame(col2_frame, text="Channel Configuration", padding="10")
+        channels_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create scrollable frame for channels
+        canvas = tk.Canvas(channels_frame)
+        scrollbar = ttk.Scrollbar(channels_frame, orient="vertical", command=canvas.yview)
+        self.channels_container = ttk.Frame(canvas)
         
         self.channels_container.bind(
             "<Configure>",
-            lambda e: canvas_col2.configure(scrollregion=canvas_col2.bbox("all"))
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
         
-        canvas_col2.create_window((0, 0), window=self.channels_container, anchor="nw")
-        canvas_col2.configure(yscrollcommand=scrollbar_col2.set)
+        canvas.create_window((0, 0), window=self.channels_container, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
         
-        canvas_col2.pack(side="left", fill="both", expand=True)
-        scrollbar_col2.pack(side="right", fill="y")
-        
-        # Placeholder label
-        self.channel_placeholder = ttk.Label(self.channels_container, 
-                                            text="Apply DAQ Configuration\nto see channel settings",
-                                            font=("Arial", 10), 
-                                            foreground="gray")
-        self.channel_placeholder.pack(pady=50)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         # ===== COLUMN 3: Control Buttons and Status Log =====
         col3_frame = ttk.Frame(self.setup_tab)
-        col3_frame.grid(row=0, column=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
+        col3_frame.grid(row=0, column=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
         
-        # Start/Stop Buttons
-        button_frame = ttk.LabelFrame(col3_frame, text="Acquisition Control", padding="10")
-        button_frame.pack(fill=tk.X, pady=(0, 10))
+        # Control Buttons
+        control_frame = ttk.LabelFrame(col3_frame, text="Control", padding="10")
+        control_frame.pack(fill=tk.X, pady=(0, 10))
         
-        self.start_button = ttk.Button(button_frame, text="Start Acquisition", 
-                                       command=self.start_acquisition, width=28)
+        self.start_button = ttk.Button(control_frame, text="▶ Start Acquisition", 
+                                       command=self.start_acquisition, width=25)
         self.start_button.pack(pady=5)
         
-        self.stop_button = ttk.Button(button_frame, text="Stop Acquisition", 
-                                      command=self.stop_acquisition, state="disabled", width=28)
+        self.stop_button = ttk.Button(control_frame, text="⏹ Stop Acquisition", 
+                                      command=self.stop_acquisition, width=25, state="disabled")
         self.stop_button.pack(pady=5)
         
         # Status Log
@@ -309,26 +315,17 @@ class ThermocopleDAQGUI:
         self.status_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Make log read-only
-        self.status_log.config(state=tk.DISABLED)
-        
-        # Add initial message
-        self.log_status("System initialized")
-        self.log_status("Ready - Please apply DAQ configuration")
-        
         # ===== COLUMN 4: Temperature Display and Statistics =====
         col4_frame = ttk.Frame(self.setup_tab)
-        col4_frame.grid(row=0, column=3, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(10, 0))
-        col4_frame.rowconfigure(1, weight=1)
-        col4_frame.columnconfigure(0, weight=1)
+        col4_frame.grid(row=0, column=3, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
         
-        # Temperature Display
-        display_frame = ttk.LabelFrame(col4_frame, text="Current Temperature Readings", padding="10")
-        display_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N), pady=(0, 10))
+        # Current Temperature Display
+        temp_frame = ttk.LabelFrame(col4_frame, text="Current Temperature", padding="10")
+        temp_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
         # Scrollable temperature display
-        temp_canvas = tk.Canvas(display_frame, height=200)
-        temp_scrollbar = ttk.Scrollbar(display_frame, orient="vertical", command=temp_canvas.yview)
+        temp_canvas = tk.Canvas(temp_frame)
+        temp_scrollbar = ttk.Scrollbar(temp_frame, orient="vertical", command=temp_canvas.yview)
         self.temp_display_frame = ttk.Frame(temp_canvas)
         
         self.temp_display_frame.bind(
@@ -339,14 +336,14 @@ class ThermocopleDAQGUI:
         temp_canvas.create_window((0, 0), window=self.temp_display_frame, anchor="nw")
         temp_canvas.configure(yscrollcommand=temp_scrollbar.set)
         
-        temp_canvas.pack(side="left", fill="both", expand=True)
-        temp_scrollbar.pack(side="right", fill="y")
+        temp_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        temp_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         self.temp_labels = []
         
         # Statistics Display
         stats_frame = ttk.LabelFrame(col4_frame, text="Statistics", padding="10")
-        stats_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        stats_frame.pack(fill=tk.BOTH, expand=True)
         
         # Scrollable statistics display
         stats_canvas = tk.Canvas(stats_frame)
@@ -361,20 +358,32 @@ class ThermocopleDAQGUI:
         stats_canvas.create_window((0, 0), window=self.stats_display_frame, anchor="nw")
         stats_canvas.configure(yscrollcommand=stats_scrollbar.set)
         
-        stats_canvas.pack(side="left", fill="both", expand=True)
-        stats_scrollbar.pack(side="right", fill="y")
+        stats_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        stats_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         self.stats_labels = []
-    
+        
+        # Initial status message
+        self.log_status("Application started. Configure modules and click 'Apply Configuration'.")
+
     def log_status(self, message):
-        """Add a message to the status log with timestamp"""
+        """Add message to status log with timestamp"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_message = f"[{timestamp}] {message}\n"
         
-        self.status_log.config(state=tk.NORMAL)
-        self.status_log.insert(tk.END, log_message)
-        self.status_log.see(tk.END)  # Auto-scroll to bottom
-        self.status_log.config(state=tk.DISABLED)
+        # Check if status_log widget exists yet
+        if not hasattr(self, 'status_log'):
+            print(log_message.strip())  # Print to console if widget doesn't exist yet
+            return
+        
+        try:
+            self.status_log.config(state=tk.NORMAL)
+            self.status_log.insert(tk.END, log_message)
+            self.status_log.see(tk.END)  # Auto-scroll to bottom
+            self.status_log.config(state=tk.DISABLED)
+        except Exception as e:
+            print(f"Error logging to status: {e}")
+            print(log_message.strip())
     
     def browse_config_folder(self):
         """Browse for configuration folder"""
@@ -395,9 +404,6 @@ class ThermocopleDAQGUI:
         try:
             # Prepare configuration dictionary
             config = {
-                'device_name': self.device_name_var.get(),
-                'num_channels': self.num_channels_var.get(),
-                'start_channel': self.start_channel_var.get(),
                 'tc_type': self.tc_type_var.get(),
                 'temp_units': self.temp_units_var.get(),
                 'experiment_name': self.experiment_name_var.get(),
@@ -417,8 +423,18 @@ class ThermocopleDAQGUI:
                     'right_y_max': self.right_y_max_var.get(),
                     'x_axis_auto': self.x_axis_auto_var.get()
                 },
+                'modules': [],  # NEW
                 'channels': []
             }
+            
+            # Save module configurations - NEW
+            for module in self.modules:
+                module_config = {
+                    'device_name': module['device_name_var'].get(),
+                    'start_channel': module['start_channel_var'].get(),
+                    'num_channels': module['num_channels_var'].get()
+                }
+                config['modules'].append(module_config)
             
             # Save channel configurations if they exist
             if hasattr(self, 'channels') and len(self.channel_label_vars) > 0:
@@ -466,9 +482,6 @@ class ThermocopleDAQGUI:
                 config = json.load(f)
             
             # Load basic settings
-            self.device_name_var.set(config.get('device_name', 'cDAQ2Mod1'))
-            self.num_channels_var.set(config.get('num_channels', 4))
-            self.start_channel_var.set(config.get('start_channel', 0))
             self.tc_type_var.set(config.get('tc_type', 'K'))
             self.temp_units_var.set(config.get('temp_units', 'Celsius'))
             self.experiment_name_var.set(config.get('experiment_name', 'TC_Experiment'))
@@ -491,8 +504,24 @@ class ThermocopleDAQGUI:
                 self.right_y_max_var.set(ps.get('right_y_max', '100'))
                 self.x_axis_auto_var.set(ps.get('x_axis_auto', True))
             
-            # Apply DAQ configuration
-            self.apply_daq_config()
+            # Load modules - NEW
+            if 'modules' in config and len(config['modules']) > 0:
+                # Clear existing modules
+                for module in self.modules:
+                    module['frame'].destroy()
+                self.modules = []
+                
+                # Load modules from config
+                for module_config in config['modules']:
+                    self.add_module_config()
+                    # Set values for the newly added module
+                    last_module = self.modules[-1]
+                    last_module['device_name_var'].set(module_config.get('device_name', 'cDAQ2Mod1'))
+                    last_module['start_channel_var'].set(module_config.get('start_channel', 0))
+                    last_module['num_channels_var'].set(module_config.get('num_channels', 4))
+            
+            # Apply module configuration
+            self.apply_all_modules()
             
             # Load channel configurations if they exist
             if 'channels' in config and len(config['channels']) > 0:
@@ -510,13 +539,15 @@ class ThermocopleDAQGUI:
         except Exception as e:
             self.log_status(f"Error loading configuration: {str(e)}")
             messagebox.showerror("Error", f"Failed to load configuration:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def apply_daq_config(self):
         """Apply DAQ configuration and rebuild channel configuration UI"""
         try:
             # Get configuration values
             device_name = self.device_name_var.get().strip()
-            num_channels = self.num_channels_var.get()
+            num_channels = self.total_channels_var.get()
             start_channel = self.start_channel_var.get()
             
             if not device_name:
@@ -529,7 +560,7 @@ class ThermocopleDAQGUI:
             
             # Store configuration
             self.device_name = device_name
-            self.num_channels = num_channels
+            self.total_channels = num_channels
             self.start_channel = start_channel
             
             # Build channel list
@@ -677,6 +708,10 @@ class ThermocopleDAQGUI:
         self.run_tab_channel_frame = ttk.Frame(self.control_bar)
         self.run_tab_channel_frame.pack(side=tk.LEFT)
         
+        # Add Reset Zoom button - NEW
+        ttk.Separator(self.control_bar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=10)
+        ttk.Button(self.control_bar, text="Reset Zoom", command=self.reset_zoom, width=12).pack(side=tk.LEFT, padx=5)
+        
         # ===== Plot Customization Bar - Row 2 =====
         customization_frame = ttk.LabelFrame(self.run_tab, text="Plot Customization", padding="5")
         customization_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
@@ -712,14 +747,16 @@ class ThermocopleDAQGUI:
         # X-Axis Range (Time)
         ttk.Label(row2_frame, text="X-Axis (Auto):", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
         self.x_axis_auto_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2_frame, text="Auto", variable=self.x_axis_auto_var).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(row2_frame, text="Auto", variable=self.x_axis_auto_var, 
+                        command=self.on_axis_auto_change).pack(side=tk.LEFT, padx=2)  # Added command
         
         ttk.Separator(row2_frame, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=10)
         
         # Left Y-Axis Range
         ttk.Label(row2_frame, text="Left Y-Axis:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
         self.left_y_auto_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2_frame, text="Auto", variable=self.left_y_auto_var).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(row2_frame, text="Auto", variable=self.left_y_auto_var,
+                        command=self.on_axis_auto_change).pack(side=tk.LEFT, padx=2)  # Added command
         
         ttk.Label(row2_frame, text="Min:").pack(side=tk.LEFT, padx=(10, 2))
         self.left_y_min_var = tk.StringVar(value="0")
@@ -734,7 +771,8 @@ class ThermocopleDAQGUI:
         # Right Y-Axis Range
         ttk.Label(row2_frame, text="Right Y-Axis:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
         self.right_y_auto_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2_frame, text="Auto", variable=self.right_y_auto_var).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(row2_frame, text="Auto", variable=self.right_y_auto_var,
+                        command=self.on_axis_auto_change).pack(side=tk.LEFT, padx=2)  # Added command
         
         ttk.Label(row2_frame, text="Min:").pack(side=tk.LEFT, padx=(10, 2))
         self.right_y_min_var = tk.StringVar(value="0")
@@ -762,6 +800,10 @@ class ThermocopleDAQGUI:
         self.ax.set_ylabel("Temperature (°C)", fontsize=12)
         self.ax.set_title("Thermocouple Temperature vs Time", fontsize=14, fontweight='bold')
         self.ax.grid(True, alpha=0.3)
+        
+        # Connect zoom callbacks - NEW
+        self.ax.callbacks.connect('xlim_changed', self.on_xlims_change)
+        self.ax.callbacks.connect('ylim_changed', self.on_ylims_change)
         
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.canvas.draw()
@@ -896,7 +938,7 @@ class ThermocopleDAQGUI:
             self.csv_file = open(self.csv_filepath, 'w', newline='')
             self.csv_writer = csv.writer(self.csv_file)
             # Write header with custom labels
-            header = ["Timestamp"] + [self.channel_label_vars[i].get() for i in range(self.num_channels)]
+            header = ["Timestamp"] + [self.channel_label_vars[i].get() for i in range(self.total_channels)]
             self.csv_writer.writerow(header)
         
         self.current_file_start_time = time.time()
@@ -914,13 +956,13 @@ class ThermocopleDAQGUI:
                     group_object = GroupObject("Thermocouple_Data")
                     
                     # Initialize data collectors
-                    channels_data = {i: [] for i in range(self.num_channels)}
+                    channels_data = {i: [] for i in range(self.total_channels)}
                     timestamps_data = []
                     
                     # Collect buffered data
                     for ts, temps in self.tdms_buffer:
                         for i, temp in enumerate(temps):
-                            if i < self.num_channels:
+                            if i < self.total_channels:
                                 channels_data[i].append(float(temp))  # Ensure float
                         
                         # Convert timestamp to Excel date format
@@ -931,7 +973,7 @@ class ThermocopleDAQGUI:
                     
                     # Create channel objects
                     channels = []
-                    for i in range(self.num_channels):
+                    for i in range(self.total_channels):
                         channel_name = self.channel_label_vars[i].get()
                         channel_array = np.array(channels_data[i], dtype=np.float64)
                         
@@ -1005,13 +1047,13 @@ class ThermocopleDAQGUI:
                 group_object = GroupObject("Thermocouple_Data")
                 
                 # Initialize data collectors
-                channels_data = {i: [] for i in range(self.num_channels)}
+                channels_data = {i: [] for i in range(self.total_channels)}
                 timestamps_data = []
                 
                 # Collect buffered data
                 for ts, temps in self.tdms_buffer:
                     for i, temp in enumerate(temps):
-                        if i < self.num_channels:
+                        if i < self.total_channels:
                             channels_data[i].append(float(temp))  # Ensure float
                     
                     # Convert timestamp to Excel date format
@@ -1022,7 +1064,7 @@ class ThermocopleDAQGUI:
                 
                 # Create channel objects with 1D numpy arrays
                 channels = []
-                for i in range(self.num_channels):
+                for i in range(self.total_channels):
                     channel_name = self.channel_label_vars[i].get()
                     # Convert to 1D numpy array of float64
                     channel_array = np.array(channels_data[i], dtype=np.float64)
@@ -1076,7 +1118,7 @@ class ThermocopleDAQGUI:
             # Clear previous data
             with self.data_lock:
                 self.timestamps = []
-                self.temperature_data = [[] for _ in range(self.num_channels)]
+                self.temperature_data = [[] for _ in range(self.total_channels)]  # Changed from num_channels
             
             # Create initial files
             self.create_new_files()
@@ -1091,7 +1133,7 @@ class ThermocopleDAQGUI:
             
             self.log_status("=== Acquisition Started ===")
             self.log_status(f"Rate: {self.acq_rate_var.get()}")
-            self.log_status(f"Device: {self.device_name}")
+            self.log_status(f"Total Channels: {self.total_channels}")
             
             # Start acquisition thread
             self.acq_thread = threading.Thread(target=self.acquisition_loop, daemon=True)
@@ -1103,10 +1145,20 @@ class ThermocopleDAQGUI:
         except Exception as e:
             self.log_status(f"ERROR starting acquisition: {str(e)}")
             messagebox.showerror("Error", f"Failed to start acquisition:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
             self.stop_acquisition()
     
     def stop_acquisition(self):
-        """Stop data acquisition"""
+        """Stop data acquisition with confirmation dialog"""
+        # Create custom confirmation dialog
+        response = self.confirm_stop_dialog()
+        
+        if not response:
+            self.log_status("Stop acquisition cancelled by user")
+            return
+        
+        # User confirmed - proceed with stopping
         self.acquisition_running = False
         self.start_button.config(state="normal")
         self.stop_button.config(state="disabled")
@@ -1118,9 +1170,88 @@ class ThermocopleDAQGUI:
         
         # Close files
         self.close_files()
+    
+    def confirm_stop_dialog(self):
+        """Custom confirmation dialog for stopping acquisition"""
+        # Create a custom dialog window
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Stop Acquisition Confirmation")
+        dialog.geometry("500x200")  # Increased size
+        dialog.resizable(False, False)
         
-        # Close files
-        self.close_files()
+        # Make it modal
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center the dialog on the parent window
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (250)  # Half of width
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (100)  # Half of height
+        dialog.geometry(f"500x200+{x}+{y}")
+        
+        # Variable to store result
+        result = [False]
+        
+        # Main container
+        main_frame = ttk.Frame(dialog)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Warning icon and message
+        message_frame = ttk.Frame(main_frame)
+        message_frame.pack(fill=tk.BOTH, expand=True)
+        
+        warning_label = ttk.Label(message_frame, 
+                 text="⚠️  Stop Data Acquisition?", 
+                 font=("Arial", 14, "bold"),
+                 foreground="red")
+        warning_label.pack(pady=(0, 15))
+        
+        message_label = ttk.Label(message_frame, 
+                 text="Are you sure you want to STOP data acquisition?\n\nThis will close the current data files.",
+                 font=("Arial", 10),
+                 justify=tk.CENTER)
+        message_label.pack(pady=(0, 20))
+        
+        # Button frame at the bottom
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+        
+        # Configure button frame columns
+        button_frame.columnconfigure(0, weight=1)
+        button_frame.columnconfigure(1, weight=1)
+        
+        def on_no():
+            result[0] = False
+            dialog.destroy()
+        
+        def on_yes():
+            result[0] = True
+            dialog.destroy()
+        
+        # Create buttons side by side
+        no_button = ttk.Button(button_frame, text="No, Continue Recording", 
+                              command=on_no)
+        no_button.grid(row=0, column=0, padx=10, pady=5, sticky=(tk.W, tk.E))
+        
+        yes_button = ttk.Button(button_frame, text="Yes, Stop Recording", 
+                               command=on_yes)
+        yes_button.grid(row=0, column=1, padx=10, pady=5, sticky=(tk.W, tk.E))
+        
+        # Set focus to No button and make it default
+        no_button.focus_set()
+        dialog.bind('<Return>', lambda e: on_no())
+        dialog.bind('<Escape>', lambda e: on_no())
+        
+        # Handle window close button (X)
+        dialog.protocol("WM_DELETE_WINDOW", on_no)
+        
+        # Force update to ensure everything is drawn
+        dialog.update_idletasks()
+        
+        # Wait for dialog to close
+        dialog.wait_window()
+        
+        return result[0]
     
     def acquisition_loop(self):
         """Main acquisition loop running in separate thread with hardware timing"""
@@ -1130,7 +1261,7 @@ class ThermocopleDAQGUI:
                 tc_type = self.get_tc_type()
                 temp_units = self.get_temp_units()
                 
-                for channel in self.channels:
+                for channel in self.channels:  # This now includes channels from all modules
                     task.ai_channels.add_ai_thrmcpl_chan(
                         channel,
                         thermocouple_type=tc_type,
@@ -1182,7 +1313,7 @@ class ThermocopleDAQGUI:
                                 if isinstance(data[0], list):
                                     # Multi-channel: extract first element from each channel
                                     data = [ch[0] if isinstance(ch, list) and len(ch) > 0 else ch for ch in data]
-                                elif self.num_channels == 1:
+                                elif self.total_channels == 1:
                                     # Single channel with single sample
                                     data = [data[0]] if isinstance(data, list) else [data]
                             
@@ -1195,7 +1326,7 @@ class ThermocopleDAQGUI:
                             with self.data_lock:
                                 self.timestamps.append(current_time)
                                 for i, temp in enumerate(data):
-                                    if i < self.num_channels:
+                                    if i < self.total_channels:  # Changed from num_channels
                                         self.temperature_data[i].append(temp)
                             
                             # Write to TDMS
@@ -1318,7 +1449,7 @@ class ThermocopleDAQGUI:
         
         # Update statistics
         with self.data_lock:
-            for i in range(self.num_channels):
+            for i in range(self.total_channels):
                 if len(self.temperature_data[i]) > 0:
                     temps = self.temperature_data[i]
                     min_temp = min(temps)
@@ -1333,9 +1464,13 @@ class ThermocopleDAQGUI:
         if not self.acquisition_running:
             return
         
+        # Set flag to indicate we're programmatically updating
+        self._updating_plot = True
+        
         try:
             with self.data_lock:
                 if len(self.timestamps) == 0:
+                    self._updating_plot = False
                     self.root.after(1000, self.update_plot)
                     return
                 
@@ -1344,16 +1479,22 @@ class ThermocopleDAQGUI:
                 current_time = datetime.now()
                 start_time = current_time - timedelta(seconds=window_seconds)
                 
-                # Filter data within time window
-                indices = [i for i, t in enumerate(self.timestamps) if t >= start_time]
+                # Filter data within time window (only if X-axis auto is ON)
+                if self.x_axis_auto_var.get() and not self.user_zoomed:
+                    # Auto mode: use time window
+                    indices = [i for i, t in enumerate(self.timestamps) if t >= start_time]
+                else:
+                    # Manual zoom mode: use all data
+                    indices = list(range(len(self.timestamps)))
                 
                 if len(indices) == 0:
+                    self._updating_plot = False
                     self.root.after(1000, self.update_plot)
                     return
                 
                 plot_times = [self.timestamps[i] for i in indices]
                 plot_data = [[self.temperature_data[ch][i] for i in indices] 
-                            for ch in range(self.num_channels)]
+                            for ch in range(self.total_channels)]
                 
                 # Decimate data for plotting (max 1000 points)
                 if len(plot_times) > 1000:
@@ -1361,28 +1502,88 @@ class ThermocopleDAQGUI:
                     plot_times = plot_times[::step]
                     plot_data = [data[::step] for data in plot_data]
             
+            # Calculate data ranges for auto-scaling
+            left_axis_data = []
+            right_axis_data = []
+            
+            for i in range(self.total_channels):
+                if self.channel_selection_vars[i].get() and len(plot_data[i]) > 0:
+                    if self.channel_yaxis_vars[i].get() == "Right":
+                        right_axis_data.extend(plot_data[i])
+                    else:
+                        left_axis_data.extend(plot_data[i])
+            
+            # Calculate auto ranges with 5% margin
+            if left_axis_data:
+                left_min_data = min(left_axis_data)
+                left_max_data = max(left_axis_data)
+                left_range = left_max_data - left_min_data
+                if left_range == 0:
+                    left_range = 1.0
+                left_margin = left_range * 0.05
+                left_auto_min = left_min_data - left_margin
+                left_auto_max = left_max_data + left_margin
+            else:
+                left_auto_min, left_auto_max = 0, 100
+            
+            if right_axis_data:
+                right_min_data = min(right_axis_data)
+                right_max_data = max(right_axis_data)
+                right_range = right_max_data - right_min_data
+                if right_range == 0:
+                    right_range = 1.0
+                right_margin = right_range * 0.05
+                right_auto_min = right_min_data - right_margin
+                right_auto_max = right_max_data + right_margin
+            else:
+                right_auto_min, right_auto_max = 0, 100
+            
+            # Store current zoom state ONLY if user has manually zoomed AND respective auto is OFF
+            current_xlim = None
+            current_ylim_left = None
+            current_ylim_right = None
+            
+            if hasattr(self, 'ax'):
+                # Only preserve X zoom if auto is OFF and user zoomed
+                if self.user_zoomed and not self.x_axis_auto_var.get():
+                    current_xlim = self.ax.get_xlim()
+                
+                # Only preserve Y zoom if auto is OFF and user zoomed
+                if self.user_zoomed and not self.left_y_auto_var.get():
+                    current_ylim_left = self.ax.get_ylim()
+            
+            # Check if we have a right axis
+            had_right_axis = hasattr(self, 'ax_right') and self.ax_right is not None
+            if had_right_axis:
+                if self.user_zoomed and not self.right_y_auto_var.get():
+                    current_ylim_right = self.ax_right.get_ylim()
+            
             # Clear the figure
             self.figure.clear()
             
             # Create primary axis
             self.ax = self.figure.add_subplot(111)
             
+            # Reconnect zoom callbacks after clearing
+            self.ax.callbacks.connect('xlim_changed', self.on_xlims_change)
+            self.ax.callbacks.connect('ylim_changed', self.on_ylims_change)
+            
             # Check if we need a secondary Y-axis
             has_right_axis = any(self.channel_yaxis_vars[i].get() == "Right" 
                                 and self.channel_selection_vars[i].get() 
-                                for i in range(self.num_channels))
+                                for i in range(self.total_channels))
             
             # Create secondary axis if needed
             if has_right_axis:
-                ax_right = self.ax.twinx()
+                self.ax_right = self.ax.twinx()
             else:
-                ax_right = None
+                self.ax_right = None
             
             # Plot channels on appropriate axes
             left_plotted = False
             right_plotted = False
             
-            for i in range(self.num_channels):
+            for i in range(self.total_channels):
                 if self.channel_selection_vars[i].get():
                     linestyle, marker = self.get_plot_style(i)
                     color = self.channel_color_vars[i].get()
@@ -1390,8 +1591,8 @@ class ThermocopleDAQGUI:
                     yaxis_side = self.channel_yaxis_vars[i].get()
                     
                     # Choose which axis to plot on
-                    if yaxis_side == "Right" and ax_right is not None:
-                        current_ax = ax_right
+                    if yaxis_side == "Right" and self.ax_right is not None:
+                        current_ax = self.ax_right
                         right_plotted = True
                     else:
                         current_ax = self.ax
@@ -1420,9 +1621,11 @@ class ThermocopleDAQGUI:
             
             # Configure X-axis
             self.ax.set_xlabel("Time", fontsize=12)
-            if not self.x_axis_auto_var.get():
-                # X-axis is time-based, auto is typically desired
-                pass
+            
+            # Set X-axis limits
+            if not self.x_axis_auto_var.get() and current_xlim is not None:
+                # Manual mode: restore user's zoom
+                self.ax.set_xlim(current_xlim)
             
             # Configure left Y-axis
             left_ylabel = self.left_yaxis_title_var.get()
@@ -1430,35 +1633,49 @@ class ThermocopleDAQGUI:
             self.ax.tick_params(axis='y', labelcolor='black')
             self.ax.grid(True, alpha=0.3)
             
-            # Apply left Y-axis limits if not auto
-            if not self.left_y_auto_var.get():
-                try:
-                    left_min = float(self.left_y_min_var.get())
-                    left_max = float(self.left_y_max_var.get())
-                    self.ax.set_ylim(left_min, left_max)
-                except ValueError:
-                    pass  # Use auto if invalid values
+            # Set left Y-axis limits - SIMPLIFIED LOGIC
+            if self.left_y_auto_var.get():
+                # AUTO MODE - always use calculated range (ignore user_zoomed for Y when auto is ON)
+                self.ax.set_ylim(left_auto_min, left_auto_max)
+            else:
+                # MANUAL MODE - use fixed range from entry boxes, or preserve user zoom
+                if current_ylim_left is not None:
+                    self.ax.set_ylim(current_ylim_left)
+                else:
+                    try:
+                        left_min = float(self.left_y_min_var.get())
+                        left_max = float(self.left_y_max_var.get())
+                        self.ax.set_ylim(left_min, left_max)
+                    except ValueError:
+                        self.ax.set_ylim(left_auto_min, left_auto_max)
             
             # Configure right Y-axis if it exists
-            if ax_right is not None and right_plotted:
+            if self.ax_right is not None and right_plotted:
                 right_ylabel = self.right_yaxis_title_var.get()
-                ax_right.set_ylabel(right_ylabel, fontsize=12, color='black')
-                ax_right.tick_params(axis='y', labelcolor='black')
+                self.ax_right.set_ylabel(right_ylabel, fontsize=12, color='black')
+                self.ax_right.tick_params(axis='y', labelcolor='black')
                 
-                # Apply right Y-axis limits if not auto
-                if not self.right_y_auto_var.get():
-                    try:
-                        right_min = float(self.right_y_min_var.get())
-                        right_max = float(self.right_y_max_var.get())
-                        ax_right.set_ylim(right_min, right_max)
-                    except ValueError:
-                        pass  # Use auto if invalid values
+                # Set right Y-axis limits - SIMPLIFIED LOGIC
+                if self.right_y_auto_var.get():
+                    # AUTO MODE - always use calculated range
+                    self.ax_right.set_ylim(right_auto_min, right_auto_max)
+                else:
+                    # MANUAL MODE - use fixed range from entry boxes, or preserve user zoom
+                    if current_ylim_right is not None:
+                        self.ax_right.set_ylim(current_ylim_right)
+                    else:
+                        try:
+                            right_min = float(self.right_y_min_var.get())
+                            right_max = float(self.right_y_max_var.get())
+                            self.ax_right.set_ylim(right_min, right_max)
+                        except ValueError:
+                            self.ax_right.set_ylim(right_auto_min, right_auto_max)
             
             # Combine legends from both axes
             if left_plotted or right_plotted:
                 lines_1, labels_1 = self.ax.get_legend_handles_labels()
-                if ax_right is not None and right_plotted:
-                    lines_2, labels_2 = ax_right.get_legend_handles_labels()
+                if self.ax_right is not None and right_plotted:
+                    lines_2, labels_2 = self.ax_right.get_legend_handles_labels()
                     lines = lines_1 + lines_2
                     labels = labels_1 + labels_2
                 else:
@@ -1474,6 +1691,9 @@ class ThermocopleDAQGUI:
             print(f"Plot update error: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            # Clear flag after update is complete
+            self._updating_plot = False
         
         # Schedule next update
         self.root.after(1000, self.update_plot)
@@ -1481,8 +1701,85 @@ class ThermocopleDAQGUI:
     def on_closing(self):
         """Handle window closing"""
         if self.acquisition_running:
-            if messagebox.askokcancel("Quit", "Acquisition is running. Stop and quit?"):
-                self.stop_acquisition()
+            # Create custom confirmation dialog
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Exit Application")
+            dialog.geometry("500x200")
+            dialog.resizable(False, False)
+            
+            # Make it modal
+            dialog.transient(self.root)
+            dialog.grab_set()
+            
+            # Center the dialog
+            dialog.update_idletasks()
+            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (250)
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (100)
+            dialog.geometry(f"500x200+{x}+{y}")
+            
+            # Variable to store result
+            result = [False]
+            
+            # Main container
+            main_frame = ttk.Frame(dialog)
+            main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+            
+            # Warning message
+            message_frame = ttk.Frame(main_frame)
+            message_frame.pack(fill=tk.BOTH, expand=True)
+            
+            warning_label = ttk.Label(message_frame, 
+                     text="⚠️  Acquisition is Running!", 
+                     font=("Arial", 14, "bold"),
+                     foreground="red")
+            warning_label.pack(pady=(0, 15))
+            
+            message_label = ttk.Label(message_frame, 
+                     text="Data acquisition is currently running.\n\nDo you want to stop and exit?",
+                     font=("Arial", 10),
+                     justify=tk.CENTER)
+            message_label.pack(pady=(0, 20))
+            
+            # Button frame at the bottom
+            button_frame = ttk.Frame(main_frame)
+            button_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
+            
+            # Configure button frame columns
+            button_frame.columnconfigure(0, weight=1)
+            button_frame.columnconfigure(1, weight=1)
+            
+            def on_cancel():
+                result[0] = False
+                dialog.destroy()
+            
+            def on_exit():
+                result[0] = True
+                dialog.destroy()
+            
+            # Create buttons
+            cancel_button = ttk.Button(button_frame, text="No, Continue Recording", 
+                                       command=on_cancel)
+            cancel_button.grid(row=0, column=0, padx=10, pady=5, sticky=(tk.W, tk.E))
+            
+            exit_button = ttk.Button(button_frame, text="Yes, Stop and Exit", 
+                                    command=on_exit)
+            exit_button.grid(row=0, column=1, padx=10, pady=5, sticky=(tk.W, tk.E))
+            
+            # Set focus to Cancel button and make it default
+            cancel_button.focus_set()
+            dialog.bind('<Return>', lambda e: on_cancel())
+            dialog.bind('<Escape>', lambda e: on_cancel())
+            dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+            
+            # Force update
+            dialog.update_idletasks()
+            
+            # Wait for dialog
+            dialog.wait_window()
+            
+            if result[0]:
+                self.acquisition_running = False
+                self.close_files()
                 self.root.destroy()
         else:
             self.root.destroy()
@@ -1556,6 +1853,13 @@ class ThermocopleDAQGUI:
     def apply_plot_settings(self):
         """Apply user-defined plot settings"""
         try:
+            # If X-axis auto is unchecked, it means user wants to maintain zoom
+            if not self.x_axis_auto_var.get():
+                self.user_zoomed = True
+            else:
+                self.user_zoomed = False
+                self.plot_xlim = None
+            
             # Validate and store the settings
             if not self.left_y_auto_var.get():
                 try:
@@ -1612,6 +1916,349 @@ class ThermocopleDAQGUI:
             for i in range(min(len(self.temp_display_labels), len(self.channel_label_vars))):
                 label_text = self.channel_label_vars[i].get()
                 self.temp_display_labels[i].config(text=f"{label_text}:")
+
+    def add_module_config(self, log=True):
+        """Add a new module configuration UI"""
+        module_index = len(self.modules)
+        
+        # Create module frame
+        module_frame = ttk.LabelFrame(self.modules_container, 
+                                      text=f"Module {module_index + 1}", 
+                                      padding="10")
+        module_frame.pack(fill=tk.X, pady=5, padx=5)
+        
+        # Module data structure
+        module_data = {
+            'frame': module_frame,
+            'device_name_var': tk.StringVar(value=f"cDAQ2Mod{module_index + 1}"),
+            'start_channel_var': tk.IntVar(value=0),
+            'num_channels_var': tk.IntVar(value=4),
+            'index': module_index
+        }
+        
+        # Device Name
+        ttk.Label(module_frame, text="Device Name:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        device_entry = ttk.Entry(module_frame, textvariable=module_data['device_name_var'], width=18)
+        device_entry.grid(row=0, column=1, pady=5, padx=5)
+        
+        # Start Channel
+        ttk.Label(module_frame, text="Start Channel (ai):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        start_ch_spinbox = ttk.Spinbox(module_frame, from_=0, to=31, 
+                                       textvariable=module_data['start_channel_var'], 
+                                       width=16)
+        start_ch_spinbox.grid(row=1, column=1, pady=5, padx=5)
+        
+        # Number of Channels
+        ttk.Label(module_frame, text="Number of Channels:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        num_ch_spinbox = ttk.Spinbox(module_frame, from_=1, to=32, 
+                                     textvariable=module_data['num_channels_var'], 
+                                     width=16)
+        num_ch_spinbox.grid(row=2, column=1, pady=5, padx=5)
+        
+        # Delete button
+        delete_btn = ttk.Button(module_frame, text="🗑️ Delete Module", 
+                               command=lambda idx=module_index: self.delete_module_config(idx),
+                               width=18)
+        delete_btn.grid(row=3, column=0, columnspan=2, pady=(10, 0))
+        module_data['delete_button'] = delete_btn
+        
+        # Store module data
+        self.modules.append(module_data)
+        
+        # Update module numbering
+        self.update_module_numbers()
+        
+        # Only log if requested (not during initial setup)
+        if log:
+            self.log_status(f"Module {module_index + 1} configuration added")
+    
+    def delete_module_config(self, module_index):
+        """Delete a module configuration"""
+        if len(self.modules) <= 1:
+            messagebox.showwarning("Warning", "Cannot delete the last module!\n\nAt least one module is required.")
+            return
+        
+        # Find the actual module by index (not position in list)
+        module_to_delete = None
+        list_position = -1
+        for i, module in enumerate(self.modules):
+            if module['index'] == module_index:
+                module_to_delete = module
+                list_position = i
+                break
+        
+        if module_to_delete is None:
+            return
+        
+        # Confirm deletion
+        response = messagebox.askyesno(
+            "Delete Module",
+            f"Are you sure you want to delete {module_to_delete['device_name_var'].get()}?"
+        )
+        
+        if response:
+            # Remove from GUI
+            module_to_delete['frame'].destroy()
+            
+            # Remove from list
+            self.modules.pop(list_position)
+            
+            # Update module numbers
+            self.update_module_numbers()
+            
+            self.log_status(f"Module configuration deleted")
+    
+    def update_module_numbers(self):
+        """Update module frame titles after add/delete"""
+        for i, module in enumerate(self.modules):
+            module['frame'].config(text=f"Module {i + 1}")
+    
+    def apply_all_modules(self):
+        """Apply configuration for all modules and rebuild channel UI"""
+        try:
+            if len(self.modules) == 0:
+                messagebox.showerror("Error", "No modules configured!")
+                return
+            
+            # Build channel list from all modules
+            all_channels = []
+            module_info = []
+            
+            for module in self.modules:
+                device_name = module['device_name_var'].get().strip()
+                num_channels = module['num_channels_var'].get()
+                start_channel = module['start_channel_var'].get()
+                
+                if not device_name:
+                    messagebox.showerror("Error", f"Module {module['index'] + 1}: Device name cannot be empty!")
+                    return
+                
+                if num_channels < 1 or num_channels > 32:
+                    messagebox.showerror("Error", f"Module {module['index'] + 1}: Number of channels must be between 1 and 32!")
+                    return
+                
+                # Build channels for this module
+                for i in range(num_channels):
+                    channel_name = f"{device_name}/ai{start_channel + i}"
+                    all_channels.append(channel_name)
+                    module_info.append({
+                        'device': device_name,
+                        'channel_index': start_channel + i,
+                        'module_index': module['index']
+                    })
+            
+            # Store configuration
+            self.channels = all_channels
+            self.module_info = module_info
+            self.total_channels = len(all_channels)
+            
+            # Clear existing channel configuration UI
+            for widget in self.channels_container.winfo_children():
+                widget.destroy()
+            
+            # Clear existing temp and stats displays
+            for widget in self.temp_display_frame.winfo_children():
+                widget.destroy()
+            for widget in self.stats_display_frame.winfo_children():
+                widget.destroy()
+            
+            # Reset lists
+            self.channel_selection_vars = []
+            self.channel_label_vars = []
+            self.channel_style_vars = []
+            self.channel_color_vars = []
+            self.channel_yaxis_vars = []
+            self.temp_labels = []
+            self.stats_labels = []
+            self.temperature_data = [[] for _ in range(self.total_channels)]
+            self.channel_name_entries = []
+            self.temp_display_labels = []
+            
+            # Create channel configuration UI for all channels
+            for i in range(self.total_channels):
+                info = module_info[i]
+                device_name = info['device']
+                channel_index = info['channel_index']
+                
+                ch_frame = ttk.LabelFrame(self.channels_container, 
+                                         text=f"Ch{i}: {device_name}/ai{channel_index}", 
+                                         padding="5")
+                ch_frame.pack(fill=tk.X, pady=5, padx=5)
+                
+                # Enable checkbox
+                var = tk.BooleanVar(value=True)
+                self.channel_selection_vars.append(var)
+                ttk.Checkbutton(ch_frame, text="Enable", variable=var).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=2)
+                
+                # Custom Label
+                ttk.Label(ch_frame, text="Label:").grid(row=1, column=0, sticky=tk.W, pady=2)
+                label_var = tk.StringVar(value=f"{device_name}_ai{channel_index}")
+                self.channel_label_vars.append(label_var)
+                label_entry = ttk.Entry(ch_frame, textvariable=label_var, width=18)
+                label_entry.grid(row=1, column=1, pady=2, padx=2)
+                self.channel_name_entries.append(label_entry)
+                
+                # Add trace to update Run tab when label changes
+                label_var.trace_add('write', lambda *args, idx=i: self.on_channel_label_change(idx))
+                
+                # Color selection
+                ttk.Label(ch_frame, text="Color:").grid(row=2, column=0, sticky=tk.W, pady=2)
+                color_var = tk.StringVar(value=self.colors[i % len(self.colors)])
+                self.channel_color_vars.append(color_var)
+                color_combo = ttk.Combobox(ch_frame, textvariable=color_var,
+                                          values=self.colors,
+                                          state="readonly", width=15)
+                color_combo.grid(row=2, column=1, pady=2, padx=2)
+                
+                # Style selection
+                ttk.Label(ch_frame, text="Style:").grid(row=3, column=0, sticky=tk.W, pady=2)
+                style_var = tk.StringVar(value="Line")
+                self.channel_style_vars.append(style_var)
+                style_combo = ttk.Combobox(ch_frame, textvariable=style_var,
+                                          values=['Line', 'Dashed', 'Dotted', 'Dash-Dot', 
+                                                 'Scatter', 'Line+Scatter'],
+                                          state="readonly", width=15)
+                style_combo.grid(row=3, column=1, pady=2, padx=2)
+                
+                # Y-Axis selection
+                ttk.Label(ch_frame, text="Y-Axis:").grid(row=4, column=0, sticky=tk.W, pady=2)
+                yaxis_var = tk.StringVar(value="Left")
+                self.channel_yaxis_vars.append(yaxis_var)
+                yaxis_combo = ttk.Combobox(ch_frame, textvariable=yaxis_var,
+                                           values=['Left', 'Right'],
+                                           state="readonly", width=15)
+                yaxis_combo.grid(row=4, column=1, pady=2, padx=2)
+                
+                # Create temperature display
+                temp_frame = ttk.Frame(self.temp_display_frame)
+                temp_frame.pack(fill=tk.X, pady=3)
+                
+                channel_display_label = ttk.Label(temp_frame, text=f"{device_name}_ai{channel_index}:", 
+                                                 font=("Arial", 10, "bold"), width=20)
+                channel_display_label.pack(side=tk.LEFT, padx=5)
+                
+                temp_label = ttk.Label(temp_frame, text="-- °C", font=("Arial", 11), foreground="darkgreen")
+                temp_label.pack(side=tk.LEFT, padx=5)
+                self.temp_labels.append(temp_label)
+                self.temp_display_labels.append(channel_display_label)
+                
+                # Create statistics display
+                stats_frame_inner = ttk.Frame(self.stats_display_frame)
+                stats_frame_inner.pack(fill=tk.X, pady=2)
+                
+                ttk.Label(stats_frame_inner, text=f"Ch{i}:", width=5).pack(side=tk.LEFT)
+                label = ttk.Label(stats_frame_inner, text="Min: -- | Max: -- | Avg: --", font=("Arial", 9))
+                label.pack(side=tk.LEFT, padx=5)
+                self.stats_labels.append(label)
+            
+            # Rebuild Run tab channel controls
+            self.rebuild_run_tab_controls()
+            
+            # Log summary
+            summary = f"Configuration Applied: {self.total_channels} total channels across {len(self.modules)} module(s)"
+            for module in self.modules:
+                summary += f"\n  - {module['device_name_var'].get()}: {module['num_channels_var'].get()} channels"
+            
+            self.log_status(summary)
+            messagebox.showinfo("Success", f"Configuration Applied!\n\n{self.total_channels} channels configured across {len(self.modules)} module(s)")
+            
+        except Exception as e:
+            self.log_status(f"Error applying configuration: {str(e)}")
+            messagebox.showerror("Error", f"Failed to apply configuration:\n{str(e)}")
+            import traceback
+            traceback.print_exc()
+
+    def browse_data_path(self):
+        """Browse for data save directory"""
+        directory = filedialog.askdirectory(
+            initialdir=self.data_path_var.get(),
+            title="Select Data Save Directory"
+        )
+        if directory:
+            self.data_path_var.set(directory)
+            self.log_status(f"Data path set to: {directory}")
+    
+    def browse_config_path(self):
+        """Browse for configuration file directory"""
+        directory = filedialog.askdirectory(
+            initialdir=self.config_path_var.get(),
+            title="Select Configuration File Directory"
+        )
+        if directory:
+            self.config_path_var.set(directory)
+            self.log_status(f"Config path set to: {directory}")
+    
+    def update_acquisition_rate(self, event=None):
+        """Update acquisition rate and file rotation interval"""
+        rate_str = self.acq_rate_var.get()
+        rate_value = float(rate_str.split()[0])
+        self.acquisition_rate = rate_value
+        
+        # Update file rotation interval
+        if rate_value <= 1.0:
+            self.file_rotation_interval = 12 * 3600  # 12 hours
+        else:
+            self.file_rotation_interval = 3 * 3600   # 3 hours
+        
+        self.log_status(f"Acquisition rate set to {rate_str}")
+        
+    def on_xlims_change(self, event_ax):
+        """Called when x-axis limits change (user zoomed)"""
+        if hasattr(self, 'ax') and event_ax == self.ax:
+            # Only mark as user zoomed if we're not currently updating the plot
+            if hasattr(self, '_updating_plot') and self._updating_plot:
+                return  # Ignore programmatic changes
+            self.plot_xlim = self.ax.get_xlim()
+            self.user_zoomed = True
+            print("X-axis: User zoom detected")
+    
+    def on_ylims_change(self, event_ax):
+        """Called when y-axis limits change (user zoomed)"""
+        if hasattr(self, 'ax') and event_ax == self.ax:
+            # Only mark as user zoomed if we're not currently updating the plot
+            if hasattr(self, '_updating_plot') and self._updating_plot:
+                return  # Ignore programmatic changes
+            self.plot_ylim_left = self.ax.get_ylim()
+            self.user_zoomed = True
+            print("Y-axis: User zoom detected")
+            self.user_zoomed = True
+    
+    def reset_zoom(self):
+        """Reset zoom to auto mode"""
+        self.user_zoomed = False
+        self.plot_xlim = None
+        self.plot_ylim_left = None
+        self.plot_ylim_right = None
+        self.x_axis_auto_var.set(True)
+        self.left_y_auto_var.set(True)
+        self.right_y_auto_var.set(True)
+        self.log_status("Zoom reset to auto mode")
+
+    def on_axis_auto_change(self):
+        """Called when any axis auto checkbox is toggled"""
+        # When switching from manual to auto on X-axis, reset zoom
+        if self.x_axis_auto_var.get():
+            self.user_zoomed = False
+            self.plot_xlim = None
+        
+        # Log the change
+        status_parts = []
+        if self.x_axis_auto_var.get():
+            status_parts.append("X-axis: Auto")
+        else:
+            status_parts.append("X-axis: Manual zoom enabled")
+        
+        if self.left_y_auto_var.get():
+            status_parts.append("Left Y-axis: Auto")
+        else:
+            status_parts.append("Left Y-axis: Fixed range")
+        
+        if self.right_y_auto_var.get():
+            status_parts.append("Right Y-axis: Auto")
+        else:
+            status_parts.append("Right Y-axis: Fixed range")
+        
+        self.log_status(" | ".join(status_parts))
 
 def main():
     root = tk.Tk()
