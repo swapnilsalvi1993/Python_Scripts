@@ -1206,6 +1206,10 @@ class ThermocopleDAQGUI:
                 messagebox.showerror("Error", "Please apply DAQ configuration before starting acquisition!")
                 return
             
+            # (NEW) clear ring buffer for a fresh run
+            if self.ring is not None:
+                self.ring.clear()
+            
             # Update acquisition rate
             self.update_acquisition_rate()
             
@@ -2146,6 +2150,12 @@ class ThermocopleDAQGUI:
             self.module_info = module_info
             self.total_channels = len(all_channels)
             
+            self.update_acquisition_rate()
+            self.rebuild_ring_buffer() # NEW
+            
+########### Just a verificaion - can be removed if needed
+            self.log_status(f"Ring buffer: channels={self.ring.channels}, capacity={self.ring.capacity} samples")
+            
             # Clear existing channel configuration UI
             for widget in self.channels_container.winfo_children():
                 widget.destroy()
@@ -2282,20 +2292,6 @@ class ThermocopleDAQGUI:
             self.config_path_var.set(directory)
             self.log_status(f"Config path set to: {directory}")
     
-    def update_acquisition_rate(self, event=None):
-        """Update acquisition rate and file rotation interval"""
-        rate_str = self.acq_rate_var.get()
-        rate_value = float(rate_str.split()[0])
-        self.acquisition_rate = rate_value
-        
-        # Update file rotation interval
-        if rate_value <= 1.0:
-            self.file_rotation_interval = 12 * 3600  # 12 hours
-        else:
-            self.file_rotation_interval = 3 * 3600   # 3 hours
-        
-        self.log_status(f"Acquisition rate set to {rate_str}")
-        
     def on_xlims_change(self, event_ax):
         """Called when x-axis limits change (user zoomed)"""
         if hasattr(self, 'ax') and event_ax == self.ax:
@@ -2353,6 +2349,26 @@ class ThermocopleDAQGUI:
             status_parts.append("Right Y-axis: Fixed range")
         
         self.log_status(" | ".join(status_parts))
+        
+    def rebuild_ring_buffer(self):
+        """
+        (Re)create the in-memory ring buffer for plotting/stats.
+        Keeps only last 7 days @ acquisition_rate (1 Hz preferred).
+        """
+        # We want capacity based on configured acquisition rate (Hz).
+        # If acquisition_rate isn't set yet or is invalid, assume 1 Hz.
+        try:
+            hz = float(self.acquisition_rate)
+            if hz <= 0:
+                hz = 1.0
+        except Exception:
+            hz = 1.0
+    
+        # Capacity = window_seconds * Hz, plus a small margin
+        capacity = int(self.max_plot_window_seconds * hz) + 10
+        channels = int(self.total_channels)
+    
+        self.ring = MultiChannelRingBuffer(channels=channels, capacity=capacity, dtype=np.float32)
 
 def main():
     root = tk.Tk()
