@@ -2714,8 +2714,16 @@ def get_stats_window_snapshot(self):
 
     def on_channel_selection_changed(self):
         """Called when any channel selection checkbox changes."""
-        self.request_plot_rebuild()
-        self.rebuild_stats_display()
+        # Rebuild plot lines/legend on next refresh
+        if hasattr(self, "request_plot_rebuild"):
+            self.request_plot_rebuild()
+        else:
+            # fallback
+            self.plot_needs_rebuild = True
+    
+        # Rebuild stats rows to show only selected channels
+        if hasattr(self, "rebuild_stats_display"):
+            self.rebuild_stats_display()
 
     def get_plot_window_snapshot(self):
         """
