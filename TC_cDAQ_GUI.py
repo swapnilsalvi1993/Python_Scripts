@@ -190,6 +190,10 @@ class ThermocopleDAQGUI:
         self.right_y_min_var = tk.StringVar(value="0")
         self.right_y_max_var = tk.StringVar(value="100")
         
+        # --- Run-tab plot refresh controls (NEW) ---
+        self.plot_refresh_interval_var = tk.StringVar(value="2 sec")  # default
+        self.plot_info_var = tk.StringVar(value="Plot: --/-- pts | stride=-- | eff.rate=-- Hz")
+        
         # Create GUI
         self.create_widgets()
         
@@ -788,12 +792,26 @@ class ThermocopleDAQGUI:
         ttk.Label(self.control_bar, text="Time Window:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
         
         time_window_run = ttk.Combobox(self.control_bar, textvariable=self.time_window_var,
-                                        values=["30 minutes", "1 hour", "6 hours", "1 day", 
-                                               "7 days", "30 days"],
+                                        values=["30 minutes", "1 hour", "6 hours", "1 day", "7 days"],
                                         state="readonly", width=15)
         time_window_run.pack(side=tk.LEFT, padx=5)
         
         ttk.Separator(self.control_bar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        ttk.Label(self.control_bar, text="Plot Refresh:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
+        plot_refresh_combo = ttk.Combobox(
+            self.control_bar,
+            textvariable=self.plot_refresh_interval_var,
+            values=["1 sec", "2 sec", "5 sec", "10 sec"],
+            state="readonly",
+            width=8
+        )
+        plot_refresh_combo.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Separator(self.control_bar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        plot_info_label = ttk.Label(self.control_bar, textvariable=self.plot_info_var, font=("Arial", 9))
+        plot_info_label.pack(side=tk.LEFT, padx=5)
         
         # Channel Selection label
         ttk.Label(self.control_bar, text="Channels:", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
@@ -2369,6 +2387,19 @@ class ThermocopleDAQGUI:
         channels = int(self.total_channels)
     
         self.ring = MultiChannelRingBuffer(channels=channels, capacity=capacity, dtype=np.float32)
+        
+    def get_plot_refresh_seconds(self) -> int:
+        """
+        Parse plot refresh interval dropdown text like '2 sec' -> 2.
+        Default to 2 seconds if parsing fails.
+        """
+        try:
+            s = self.plot_refresh_interval_var.get().strip().lower()
+            # expected formats: '1 sec', '2 sec', ...
+            n = int(s.split()[0])
+            return max(1, n)
+        except Exception:
+            return 2
 
 def main():
     root = tk.Tk()
