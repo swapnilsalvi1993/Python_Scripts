@@ -153,6 +153,8 @@ class ThermocopleDAQGUI:
         self.temp_display_labels = []
         self.channel_name_entries = []
         
+        self.stats_channel_indices = []
+        
         # TDMS buffering
         self.tdms_buffer = []
         self.tdms_buffer_size = 10
@@ -941,7 +943,7 @@ class ThermocopleDAQGUI:
             cb = ttk.Checkbutton(self.run_tab_channel_frame, 
                                text=channel_label,  # Use custom label instead of "Ch{i}"
                                variable=self.channel_selection_vars[i],
-                               command=self.update_run_tab_labels)  # Update when changed
+                               command=self.on_channel_selection_changed)  # Update when changed
             cb.pack(side=tk.LEFT, padx=2)
     
     def update_run_tab_labels(self):
@@ -1271,11 +1273,12 @@ class ThermocopleDAQGUI:
             self.acq_thread = threading.Thread(target=self.acquisition_loop, daemon=True)
             self.acq_thread.start()
             
-            # Start stats update loop (NEW)
-            self.stats_timer_loop()
-            
             # Start plot update timer
             self.update_plot_from_ring()
+            
+            # NEW: build stats panel for selected channels and start stats loop
+            self.rebuild_stats_display()
+            self.stats_timer_loop()
             
         except Exception as e:
             self.log_status(f"ERROR starting acquisition: {str(e)}")
@@ -2692,42 +2695,6 @@ class ThermocopleDAQGUI:
         x_dt = [datetime.fromtimestamp(ts) for ts in times_ds]
         return x_dt, data_ds, n_raw, stride, hz
 
-    def update_statistics_from_ring(self):
-        """
-        Update per-channel stats using the currently selected time window.
-        Uses ring buffer snapshot (bounded, fast).
-        """
-        try:
-            x, data_ds, n_raw, stride, hz = self.get_window_snapshot()
-            if data_ds is None or data_ds.shape[1] == 0:
-                return
-    
-            # Stats computed on downsampled window for speed.
-            # If you want exact stats, we can compute on raw window later.
-            unit_symbol = self.get_temp_unit_symbol()
-    
-            for i in range(self.total_channels):
-                # Only compute stats for selected channels (as requested)
-                if not self.channel_selection_vars[i].get():
-                    continue
-    
-                y = data_ds[i, :]
-                if y.size == 0:
-                    continue
-    
-                # NaN-safe
-                y_min = float(np.nanmin(y))
-                y_max = float(np.nanmax(y))
-                y_avg = float(np.nanmean(y))
-    
-                if i < len(self.stats_labels):
-                    self.stats_labels[i].config(
-                        text=f"Min: {y_min:.2f} {unit_symbol} | Max: {y_max:.2f} {unit_symbol} | Avg: {y_avg:.2f} {unit_symbol}"
-                    )
-        except Exception:
-            # Keep UI safe
-            pass
-
     def stats_timer_loop(self):
         if not self.acquisition_running:
             return
@@ -2737,6 +2704,68 @@ class ThermocopleDAQGUI:
     def request_plot_rebuild(self):
         """Mark plot for rebuild on next refresh (safe from UI callbacks)."""
         self.plot_needs_rebuild = True
+
+    def rebuild_stats_display(self):
+        """Rebuild the stats widgets to show only currently selected (plotted) channels."""
+        # Clear existing widgets
+        for w in self.stats_display_frame.winfo_children():
+            w.destroy()
+    
+        self.stats_labels = []
+        self.stats_channel_indices = []  # map label index -> channel index
+    
+        # Build rows only for selected channels
+        for ch in range(self.total_channels):
+            if not self.channel_selection_vars[ch].get():
+                continue
+    
+            name = self.channel_label_vars[ch].get()
+    
+            row = ttk.Frame(self.stats_display_frame)
+            row.pack(fill=tk.X, pady=2)
+    
+            ttk.Label(row, text=name, width=18).pack(side=tk.LEFT, padx=(0, 6))
+    
+            lbl = ttk.Label(row, text="Min: -- | Max: -- | Avg: --", anchor="w")
+            lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    
+            self.stats_labels.append(lbl)
+            self.stats_channel_indices.append(ch)
+            
+    def update_statistics_from_ring(self):
+        """Update statistics for selected (plotted) channels using current time window from ring buffer."""
+        try:
+            data, n_raw, stride, hz = self.get_window_snapshot()
+            if data is None or n_raw <= 0:
+                return
+    
+            unit_symbol = self.get_temp_unit_symbol()
+    
+            # Update only rows that exist (selected channels)
+            for row_i, ch in enumerate(self.stats_channel_indices):
+                if row_i >= len(self.stats_labels):
+                    continue
+    
+                y = data[ch, :]
+                if y.size == 0:
+                    self.stats_labels[row_i].config(text="Min: -- | Max: -- | Avg: --")
+                    continue
+    
+                # NaN-safe stats (exact on full window)
+                y_min = float(np.nanmin(y))
+                y_max = float(np.nanmax(y))
+                y_avg = float(np.nanmean(y))
+    
+                self.stats_labels[row_i].config(
+                    text=f"Min: {y_min:.2f} {unit_symbol} | Max: {y_max:.2f} {unit_symbol} | Avg: {y_avg:.2f} {unit_symbol}"
+                )
+        except Exception:
+            pass
+
+    def on_channel_selection_changed(self):
+        """Called when any channel selection checkbox changes."""
+        self.request_plot_rebuild()
+        self.rebuild_stats_display()
 
 def main():
     root = tk.Tk()
