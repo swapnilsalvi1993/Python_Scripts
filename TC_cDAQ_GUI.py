@@ -2513,74 +2513,29 @@ class ThermocopleDAQGUI:
         refresh_s = self.get_plot_refresh_seconds()
     
         try:
+            # Rebuild plot objects first if needed
+            if getattr(self, "plot_needs_rebuild", False):
+                self.plot_needs_rebuild = False
+                self.init_plot_lines()
+    
+            # Get downsampled window for plotting
             x, data_ds, n_raw, stride, hz = self.get_plot_window_snapshot()
-            if data_ds is None or len(x) == 0:
-                self.root.after(self.get_plot_refresh_seconds() * 1000, self.update_plot_from_ring)
+            if data_ds is None or len(x) < 2:
+                self.root.after(refresh_s * 1000, self.update_plot_from_ring)
                 return
-            
+    
             n_ds = data_ds.shape[1]
             eff_rate = hz / stride if stride > 0 else hz
-            
-            
-            if self.ring is None or self.ring.count == 0:
-                self.root.after(refresh_s * 1000, self.update_plot_from_ring)
-                return
     
-            window_s = self.get_time_window_seconds()
-    
-            # number of samples to fetch ~= window_s * acquisition_rate (Hz)
-            # use ring capacity logic; fetch a bit more then trim by time if needed
-            try:
-                hz = float(self.acquisition_rate) if self.acquisition_rate > 0 else 1.0
-            except Exception:
-                hz = 1.0
-    
-            n_want = int(window_s * hz) + 5
-            snap = self.ring.snapshot_last(n_want)
-    
-            if snap.count == 0:
-                self.root.after(refresh_s * 1000, self.update_plot_from_ring)
-                return
-    
-            # Convert time to matplotlib-friendly datetime objects only after downsampling
-            # First trim by time window precisely (since rate may drift)
-            t_end = snap.times[-1]
-            t_start = t_end - window_s
-            # times are sorted in snapshot; find first index >= t_start
-            idx0 = int(np.searchsorted(snap.times, t_start, side="left"))
-            times = snap.times[idx0:]
-            data = snap.data[:, idx0:]
-            n_raw = times.shape[0]
-            if n_raw <= 1:
-                self.root.after(refresh_s * 1000, self.update_plot_from_ring)
-                return
-    
-            # Downsample per channel to max_plot_points_per_channel using stride
-            max_pts = int(self.max_plot_points_per_channel)
-            stride = int(np.ceil(n_raw / max_pts)) if n_raw > max_pts else 1
-            times_ds = times[::stride]
-            data_ds = data[:, ::stride]
-            n_ds = times_ds.shape[0]
-    
-            # Effective plot rate (per channel)
-            eff_rate = (hz / stride) if stride > 0 else hz
-    
-            # Convert to datetimes for x-axis
-            x = [datetime.fromtimestamp(ts) for ts in times_ds]
-    
-            # Update lines
-            y_left_min = None
-            y_left_max = None
-            y_right_min = None
-            y_right_max = None
+            # Update lines + track min/max for autoscale
+            y_left_min = y_left_max = None
+            y_right_min = y_right_max = None
     
             for i in range(self.total_channels):
                 if not self.channel_selection_vars[i].get():
                     continue
     
                 y = data_ds[i, :]
-    
-                # Skip if all nan/empty
                 if y.size == 0:
                     continue
     
@@ -2591,7 +2546,6 @@ class ThermocopleDAQGUI:
     
                 line.set_data(x, y)
     
-                # Track min/max for autoscale (only for enabled channels)
                 ymin = float(np.nanmin(y))
                 ymax = float(np.nanmax(y))
     
@@ -2601,11 +2555,7 @@ class ThermocopleDAQGUI:
                 else:
                     y_left_min = ymin if y_left_min is None else min(y_left_min, ymin)
                     y_left_max = ymax if y_left_max is None else max(y_left_max, ymax)
-            
-            if self.plot_needs_rebuild:
-                self.plot_needs_rebuild = False
-                self.init_plot_lines()
-                
+    
             # X-axis handling
             if self.x_axis_auto_var.get():
                 self.ax.set_xlim(x[0], x[-1])
@@ -2624,7 +2574,6 @@ class ThermocopleDAQGUI:
             if self.left_y_auto_var.get():
                 apply_auto_ylim(self.ax, y_left_min, y_left_max)
             else:
-                # manual fixed range
                 try:
                     self.ax.set_ylim(float(self.left_y_min_var.get()), float(self.left_y_max_var.get()))
                 except Exception:
@@ -2640,7 +2589,7 @@ class ThermocopleDAQGUI:
                     except Exception:
                         pass
     
-            # Update titles/labels (lightweight)
+            # Titles/labels
             self.ax.set_title(self.plot_title_var.get(), fontsize=14, fontweight="bold")
             self.ax.set_ylabel(self.left_yaxis_title_var.get(), fontsize=12)
             if self.ax_right is not None:
@@ -2648,7 +2597,7 @@ class ThermocopleDAQGUI:
     
             self.figure.autofmt_xdate()
     
-            # Update info label
+            # Plot info label
             self.plot_info_var.set(
                 f"Plot: {n_ds}/{n_raw} pts | stride={stride} | eff.rate={eff_rate:.4g} Hz | refresh={refresh_s}s"
             )
