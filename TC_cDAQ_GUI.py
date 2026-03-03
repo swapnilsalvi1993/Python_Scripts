@@ -1007,14 +1007,17 @@ class ThermocopleDAQGUI:
             self.file_rotation_interval = 3 * 3600   # 3 hours
     
     def get_time_window_seconds(self):
-        """Convert time window string to seconds"""
-        window_str = self.time_window_var.get()
+        """Convert time window string to seconds (max 7 days)"""
+        window_str = self.time_window_var.get().strip().lower()
+    
         if "minute" in window_str:
             return int(window_str.split()[0]) * 60
-        elif "hour" in window_str:
+        if "hour" in window_str:
             return int(window_str.split()[0]) * 3600
-        elif "day" in window_str:
-            return int(window_str.split()[0]) * 86400
+        if "day" in window_str:
+            days = int(window_str.split()[0])
+            return min(days, 7) * 86400
+    
         return 3600  # default 1 hour
     
     def generate_filename(self):
@@ -1231,10 +1234,18 @@ class ThermocopleDAQGUI:
             # Update acquisition rate
             self.update_acquisition_rate()
             
+            # Ensure ring capacity matches acquisition rate (in case rate changed)
+            if self.ring is not None:
+                self.rebuild_ring_buffer()
+            
             # Clear previous data
             with self.data_lock:
-                self.timestamps = []
-                self.temperature_data = [[] for _ in range(self.total_channels)]  # Changed from num_channels
+                # Keep these for compatibility with any remaining code paths,
+                # but DO NOT use them for long-run storage anymore.
+                # self.timestamps = []
+                # self.temperature_data = [[] for _ in range(self.total_channels)]
+                self.timestamps = None
+                self.temperature_data = None
             
             # Create initial files
             self.create_new_files()
@@ -1243,6 +1254,9 @@ class ThermocopleDAQGUI:
             self.start_button.config(state="disabled")
             self.stop_button.config(state="normal")
             self.acquisition_running = True
+            
+            # (NEW) initialize plot line objects once
+            self.init_plot_lines()
             
             # Disable configuration widgets
             self.disable_config_widgets()
@@ -1256,7 +1270,7 @@ class ThermocopleDAQGUI:
             self.acq_thread.start()
             
             # Start plot update timer
-            self.update_plot()
+            self.update_plot_from_ring()
             
         except Exception as e:
             self.log_status(f"ERROR starting acquisition: {str(e)}")
@@ -1439,11 +1453,14 @@ class ThermocopleDAQGUI:
                                 self.root.after(0, lambda: self.log_status("File rotated - new file created"))
                             
                             # Store data
-                            with self.data_lock:
-                                self.timestamps.append(current_time)
-                                for i, temp in enumerate(data):
-                                    if i < self.total_channels:  # Changed from num_channels
-                                        self.temperature_data[i].append(temp)
+                            # NEW: send sample to ring buffer (bounded memory) for plotting/stats
+                            if self.ring is not None:
+                                t_sec = time.time()
+                                with self.data_lock:
+                                    try:
+                                        self.ring.append(t_sec, data)
+                                    except Exception:
+                                        pass
                             
                             # Write to TDMS
                             self.write_tdms_data(current_time, data)
@@ -1506,11 +1523,14 @@ class ThermocopleDAQGUI:
                             data = task.read()
                             current_time = datetime.now()
                             
-                            # Store data
-                            with self.data_lock:
-                                self.timestamps.append(current_time)
-                                for i, temp in enumerate(data):
-                                    self.temperature_data[i].append(temp)
+                            # Store data to ring buffer (bounded memory) for plotting/stats
+                            if self.ring is not None:
+                                t_sec = time.time()
+                                with self.data_lock:
+                                    try:
+                                        self.ring.append(t_sec, data)
+                                    except Exception:
+                                        pass
                             
                             # Write to TDMS
                             self.write_tdms_data(current_time, data)
@@ -2015,7 +2035,7 @@ class ThermocopleDAQGUI:
             return
         
         # Just trigger update_plot immediately
-        self.update_plot()
+        self.update_plot_from_ring()
 
     def on_channel_label_change(self, channel_index):
         """Called when a channel label is changed"""
@@ -2400,6 +2420,220 @@ class ThermocopleDAQGUI:
             return max(1, n)
         except Exception:
             return 2
+
+    def init_plot_lines(self):
+        """Initialize plot axes + line objects once (call when starting acquisition or when config changes)."""
+        # Create axes if not present
+        if not hasattr(self, "figure") or self.figure is None:
+            return
+    
+        self.figure.clear()
+        self.ax = self.figure.add_subplot(111)
+        self.ax.grid(True, alpha=0.3)
+    
+        self.ax_right = None
+        self.lines_left = [None] * self.total_channels
+        self.lines_right = [None] * self.total_channels
+    
+        # Decide if any channel is assigned to right axis
+        has_right = any(
+            self.channel_selection_vars[i].get() and self.channel_yaxis_vars[i].get() == "Right"
+            for i in range(self.total_channels)
+        )
+        if has_right:
+            self.ax_right = self.ax.twinx()
+    
+        # Create Line2D objects for enabled channels (others stay None)
+        for i in range(self.total_channels):
+            if not self.channel_selection_vars[i].get():
+                continue
+    
+            linestyle, marker = self.get_plot_style(i)
+            color = self.channel_color_vars[i].get()
+            label = self.channel_label_vars[i].get()
+            side = self.channel_yaxis_vars[i].get()
+    
+            target_ax = self.ax_right if (side == "Right" and self.ax_right is not None) else self.ax
+    
+            # Start with empty data; we will set_data in updates
+            (line,) = target_ax.plot(
+                [],
+                [],
+                color=color,
+                linestyle=linestyle if linestyle else "None",
+                marker=marker if marker else None,
+                markersize=4 if marker else 0,
+                linewidth=2,
+                label=label,
+            )
+    
+            if target_ax is self.ax:
+                self.lines_left[i] = line
+            else:
+                self.lines_right[i] = line
+    
+        # Titles/labels
+        self.ax.set_title(self.plot_title_var.get(), fontsize=14, fontweight="bold")
+        self.ax.set_xlabel("Time", fontsize=12)
+        self.ax.set_ylabel(self.left_yaxis_title_var.get(), fontsize=12)
+    
+        if self.ax_right is not None:
+            self.ax_right.set_ylabel(self.right_yaxis_title_var.get(), fontsize=12)
+    
+        # Legend: build once initially (we’ll refresh legend only when needed in Step 5 if you want)
+        handles, labels = self.ax.get_legend_handles_labels()
+        if self.ax_right is not None:
+            h2, l2 = self.ax_right.get_legend_handles_labels()
+            handles += h2
+            labels += l2
+        if handles:
+            self.ax.legend(handles, labels, loc="best", fontsize=9, framealpha=0.9)
+    
+        self.canvas.draw_idle()
+
+    def update_plot_from_ring(self):
+        """Efficient plot update from ring buffer with downsampling."""
+        if not self.acquisition_running:
+            return
+    
+        refresh_s = self.get_plot_refresh_seconds()
+    
+        try:
+            if self.ring is None or self.ring.count == 0:
+                self.root.after(refresh_s * 1000, self.update_plot_from_ring)
+                return
+    
+            window_s = self.get_time_window_seconds()
+    
+            # number of samples to fetch ~= window_s * acquisition_rate (Hz)
+            # use ring capacity logic; fetch a bit more then trim by time if needed
+            try:
+                hz = float(self.acquisition_rate) if self.acquisition_rate > 0 else 1.0
+            except Exception:
+                hz = 1.0
+    
+            n_want = int(window_s * hz) + 5
+            snap = self.ring.snapshot_last(n_want)
+    
+            if snap.count == 0:
+                self.root.after(refresh_s * 1000, self.update_plot_from_ring)
+                return
+    
+            # Convert time to matplotlib-friendly datetime objects only after downsampling
+            # First trim by time window precisely (since rate may drift)
+            t_end = snap.times[-1]
+            t_start = t_end - window_s
+            # times are sorted in snapshot; find first index >= t_start
+            idx0 = int(np.searchsorted(snap.times, t_start, side="left"))
+            times = snap.times[idx0:]
+            data = snap.data[:, idx0:]
+            n_raw = times.shape[0]
+            if n_raw <= 1:
+                self.root.after(refresh_s * 1000, self.update_plot_from_ring)
+                return
+    
+            # Downsample per channel to max_plot_points_per_channel using stride
+            max_pts = int(self.max_plot_points_per_channel)
+            stride = int(np.ceil(n_raw / max_pts)) if n_raw > max_pts else 1
+            times_ds = times[::stride]
+            data_ds = data[:, ::stride]
+            n_ds = times_ds.shape[0]
+    
+            # Effective plot rate (per channel)
+            eff_rate = (hz / stride) if stride > 0 else hz
+    
+            # Convert to datetimes for x-axis
+            x = [datetime.fromtimestamp(ts) for ts in times_ds]
+    
+            # Update lines
+            y_left_min = None
+            y_left_max = None
+            y_right_min = None
+            y_right_max = None
+    
+            for i in range(self.total_channels):
+                if not self.channel_selection_vars[i].get():
+                    continue
+    
+                y = data_ds[i, :]
+    
+                # Skip if all nan/empty
+                if y.size == 0:
+                    continue
+    
+                side = self.channel_yaxis_vars[i].get()
+                line = self.lines_right[i] if (side == "Right" and self.ax_right is not None) else self.lines_left[i]
+                if line is None:
+                    continue
+    
+                line.set_data(x, y)
+    
+                # Track min/max for autoscale (only for enabled channels)
+                ymin = float(np.nanmin(y))
+                ymax = float(np.nanmax(y))
+    
+                if side == "Right":
+                    y_right_min = ymin if y_right_min is None else min(y_right_min, ymin)
+                    y_right_max = ymax if y_right_max is None else max(y_right_max, ymax)
+                else:
+                    y_left_min = ymin if y_left_min is None else min(y_left_min, ymin)
+                    y_left_max = ymax if y_left_max is None else max(y_left_max, ymax)
+    
+            # X-axis handling
+            if self.x_axis_auto_var.get():
+                self.ax.set_xlim(x[0], x[-1])
+    
+            # Y-axis handling with margin
+            def apply_auto_ylim(ax, ymin, ymax):
+                if ymin is None or ymax is None:
+                    return
+                r = ymax - ymin
+                if r == 0:
+                    r = 1.0
+                m = r * 0.05
+                ax.set_ylim(ymin - m, ymax + m)
+    
+            # Left Y
+            if self.left_y_auto_var.get():
+                apply_auto_ylim(self.ax, y_left_min, y_left_max)
+            else:
+                # manual fixed range
+                try:
+                    self.ax.set_ylim(float(self.left_y_min_var.get()), float(self.left_y_max_var.get()))
+                except Exception:
+                    pass
+    
+            # Right Y
+            if self.ax_right is not None:
+                if self.right_y_auto_var.get():
+                    apply_auto_ylim(self.ax_right, y_right_min, y_right_max)
+                else:
+                    try:
+                        self.ax_right.set_ylim(float(self.right_y_min_var.get()), float(self.right_y_max_var.get()))
+                    except Exception:
+                        pass
+    
+            # Update titles/labels (lightweight)
+            self.ax.set_title(self.plot_title_var.get(), fontsize=14, fontweight="bold")
+            self.ax.set_ylabel(self.left_yaxis_title_var.get(), fontsize=12)
+            if self.ax_right is not None:
+                self.ax_right.set_ylabel(self.right_yaxis_title_var.get(), fontsize=12)
+    
+            self.figure.autofmt_xdate()
+    
+            # Update info label
+            self.plot_info_var.set(
+                f"Plot: {n_ds}/{n_raw} pts | stride={stride} | eff.rate={eff_rate:.4g} Hz | refresh={refresh_s}s"
+            )
+    
+            self.canvas.draw_idle()
+    
+        except Exception as e:
+            # Keep UI alive even if plot update fails
+            # print(f"Plot update error: {e}")
+            pass
+    
+        self.root.after(refresh_s * 1000, self.update_plot_from_ring)
 
 def main():
     root = tk.Tk()
