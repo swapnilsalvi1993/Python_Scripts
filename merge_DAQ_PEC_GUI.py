@@ -77,12 +77,13 @@ def read_pec_file(path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(io.StringIO(data_text), sep=sep)
 
     if "Total Time (Seconds)" not in df.columns:
-        raise ValueError("PEC data table does not include 'Total Time (Seconds)' column after parsing.")
+        raise ValueError(f"{path.name}: missing 'Total Time (Seconds)' after parsing.")
 
     df["Total Time (Seconds)"] = pd.to_numeric(df["Total Time (Seconds)"], errors="coerce")
     df["pec_timestamp"] = pd.to_datetime(start_time) + pd.to_timedelta(df["Total Time (Seconds)"], unit="s")
 
-    df = df.sort_values("pec_timestamp").reset_index(drop=True)
+    # Stable sort helps with duplicate timestamps
+    df = df.sort_values("pec_timestamp", kind="mergesort").reset_index(drop=True)
     return df
 
 
@@ -105,7 +106,7 @@ def compute_pec_bounds(paths: list[str | Path]) -> pd.DataFrame:
         bounds.append((p.name, lo, hi))
 
     bdf = pd.DataFrame(bounds, columns=["file", "start", "end"])
-    bdf = bdf.sort_values("start").reset_index(drop=True)
+    bdf = bdf.sort_values("start", kind="mergesort").reset_index(drop=True)
     return bdf
 
 
@@ -133,19 +134,17 @@ def find_overlaps(bounds_df: pd.DataFrame) -> list[OverlapInfo]:
     return overlaps
 
 
-def read_multiple_pec_files(paths: list[str | Path]) -> pd.DataFrame:
-    if not paths:
-        raise ValueError("No PEC files provided.")
-
+def read_multiple_pec_files(paths: list[str | Path], battery_id: str) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for p in paths:
         p = Path(p)
         df = read_pec_file(p)
         df["pec_source_file"] = p.name
+        df["battery_id"] = battery_id
         frames.append(df)
 
     pec_all = pd.concat(frames, ignore_index=True)
-    pec_all = pec_all.sort_values("pec_timestamp").reset_index(drop=True)
+    pec_all = pec_all.sort_values("pec_timestamp", kind="mergesort").reset_index(drop=True)
     return pec_all
 
 
@@ -175,141 +174,250 @@ def read_ni_daq_file(path: str | Path) -> pd.DataFrame:
     df[col] = pd.to_numeric(df[col], errors="coerce")
     df["ni_timestamp"] = pd.to_datetime(df[col], unit="D", origin=EXCEL_EPOCH, errors="coerce")
 
-    df = df.sort_values("ni_timestamp").reset_index(drop=True)
+    # add unique row id to prevent many-to-many merges later
+    df = df.reset_index(drop=True)
+    df.insert(0, "ni_row_id", df.index.astype("int64"))
+
+    # stable sort for merge_asof, keep row_id for later reordering
+    df = df.sort_values(["ni_timestamp", "ni_row_id"], kind="mergesort").reset_index(drop=True)
     return df
 
 
 # -------------------------
-# Merge
+# Merge (multi-battery wide) - FIXED
 # -------------------------
 
-def merge_files(
+def merge_multi_battery_wide(
     ni_path: str | Path,
-    pec_paths: list[str | Path],
+    battery_to_pec_paths: dict[str, list[str]],
     tolerance_seconds: float = 0.5,
     direction: str = "nearest",
 ) -> pd.DataFrame:
-    ni_df = read_ni_daq_file(ni_path)
-    pec_df = read_multiple_pec_files(pec_paths)
+    ni = read_ni_daq_file(ni_path)
 
-    merged = pd.merge_asof(
-        ni_df,
-        pec_df,
-        left_on="ni_timestamp",
-        right_on="pec_timestamp",
-        direction=direction,
-        tolerance=pd.Timedelta(seconds=float(tolerance_seconds)),
-        suffixes=("_ni", "_pec"),
-    )
+    # We'll build output from NI, then attach per-battery PEC columns by ni_row_id (unique).
+    out = ni.copy()
 
-    merged["match_delta_seconds"] = (merged["ni_timestamp"] - merged["pec_timestamp"]).dt.total_seconds()
-    return merged
+    left_base = out[["ni_row_id", "ni_timestamp"]].copy()
+    left_base = left_base.sort_values(["ni_timestamp", "ni_row_id"], kind="mergesort").reset_index(drop=True)
+
+    for battery_id, paths in battery_to_pec_paths.items():
+        pec = read_multiple_pec_files(paths, battery_id=battery_id)
+        pec = pec.sort_values("pec_timestamp", kind="mergesort").reset_index(drop=True)
+
+        merged = pd.merge_asof(
+            left_base,
+            pec,
+            left_on="ni_timestamp",
+            right_on="pec_timestamp",
+            direction=direction,
+            tolerance=pd.Timedelta(seconds=float(tolerance_seconds)),
+        )
+
+        merged["match_delta_seconds"] = (merged["ni_timestamp"] - merged["pec_timestamp"]).dt.total_seconds()
+
+        # Prefix ALL PEC-derived columns (everything except ni_row_id/ni_timestamp)
+        keep = {"ni_row_id", "ni_timestamp"}
+        rename = {c: f"{battery_id}__{c}" for c in merged.columns if c not in keep}
+        merged = merged.rename(columns=rename)
+
+        # Only keep ni_row_id + prefixed columns for join
+        cols_to_join = ["ni_row_id"] + [c for c in merged.columns if c.startswith(f"{battery_id}__")]
+        merged_small = merged[cols_to_join].copy()
+
+        # Join back by unique ni_row_id => guaranteed 1:1, no row multiplication
+        out = out.merge(merged_small, on="ni_row_id", how="left")
+
+    # Restore original NI order by ni_row_id (so your output matches input order)
+    out = out.sort_values("ni_row_id", kind="mergesort").reset_index(drop=True)
+    return out
 
 
 # -------------------------
-# Tkinter GUI
+# Tkinter GUI (multi-battery)
 # -------------------------
 
 @dataclass
+class BatterySelection:
+    battery_id: str
+    pec_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AppState:
-    ni_path: str | None = None
-    pec_paths: list[str] = field(default_factory=list)  # always a real list
-    output_path: str | None = None
+    batteries: list[BatterySelection] = field(default_factory=list)
+
+
+class BatteryRow(ttk.Frame):
+    def __init__(self, master, app: "MergeApp", battery: BatterySelection):
+        super().__init__(master)
+        self.app = app
+        self.battery = battery
+        self.id_var = tk.StringVar(value=battery.battery_id)
+
+        ttk.Label(self, text="Battery ID (4 digits):").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self, textvariable=self.id_var, width=10).grid(row=0, column=1, sticky="w", padx=(6, 12))
+        ttk.Label(self, text="PEC files:").grid(row=0, column=2, sticky="w")
+
+        self.listbox = tk.Listbox(self, height=5, selectmode="extended")
+        self.listbox.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=(4, 0))
+
+        scroll = ttk.Scrollbar(self, orient="vertical", command=self.listbox.yview)
+        scroll.grid(row=1, column=4, sticky="ns", pady=(4, 0))
+        self.listbox.configure(yscrollcommand=scroll.set)
+
+        btns = ttk.Frame(self)
+        btns.grid(row=2, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        ttk.Button(btns, text="Add PEC files...", command=self.add_files).pack(side="left")
+        ttk.Button(btns, text="Remove selected", command=self.remove_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Clear", command=self.clear).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Remove Battery", command=self.remove_battery).pack(side="left", padx=(16, 0))
+
+        self.columnconfigure(3, weight=1)
+        self.rowconfigure(1, weight=1)
+
+    def _validate_and_set_battery_id(self) -> str | None:
+        bid = self.id_var.get().strip()
+        if not re.fullmatch(r"\d{4}", bid):
+            messagebox.showerror("Invalid Battery ID", "Battery ID must be exactly 4 digits (e.g., 2196).")
+            return None
+        self.battery.battery_id = bid
+        return bid
+
+    def add_files(self) -> None:
+        if self._validate_and_set_battery_id() is None:
+            return
+        paths = filedialog.askopenfilenames(
+            title=f"Select PEC CSV files for Battery {self.battery.battery_id}",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not paths:
+            return
+
+        existing = set(self.battery.pec_paths)
+        added = 0
+        for p in paths:
+            if p not in existing:
+                self.battery.pec_paths.append(p)
+                self.listbox.insert("end", p)
+                existing.add(p)
+                added += 1
+
+        self.app._log(f"Battery {self.battery.battery_id}: added {added} file(s). Total: {len(self.battery.pec_paths)}")
+
+    def remove_selected(self) -> None:
+        sel = list(self.listbox.curselection())
+        if not sel:
+            return
+        sel.reverse()
+        for idx in sel:
+            path = self.listbox.get(idx)
+            self.listbox.delete(idx)
+            if path in self.battery.pec_paths:
+                self.battery.pec_paths.remove(path)
+        self.app._log(f"Battery {self.battery.battery_id}: total files now {len(self.battery.pec_paths)}")
+
+    def clear(self) -> None:
+        self.listbox.delete(0, "end")
+        self.battery.pec_paths.clear()
+        self.app._log(f"Battery {self.battery.battery_id}: cleared files.")
+
+    def remove_battery(self) -> None:
+        self.app.remove_battery_row(self)
 
 
 class MergeApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("NI DAQ + PEC Cycler CSV Merger (Multi-PEC)")
-        self.geometry("980x520")
+        self.title("NI DAQ + PEC Cycler CSV Merger (Multi-Battery)")
+        self.geometry("1100x700")
 
-        self.state_data = AppState()
+        self.state = AppState()
+        self.battery_rows: list[BatteryRow] = []
+
         self._build_ui()
 
     def _build_ui(self) -> None:
         pad = {"padx": 10, "pady": 6}
 
-        frm = ttk.Frame(self)
-        frm.pack(fill="both", expand=True, **pad)
+        root = ttk.Frame(self)
+        root.pack(fill="both", expand=True, **pad)
 
         self.ni_var = tk.StringVar(value="")
         self.out_var = tk.StringVar(value="")
-
-        row = 0
-        ttk.Label(frm, text="NI DAQ CSV:").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.ni_var, width=100).grid(row=row, column=1, sticky="we")
-        ttk.Button(frm, text="Browse...", command=self.pick_ni).grid(row=row, column=2, sticky="e")
-
-        row += 1
-        ttk.Label(frm, text="PEC Cycler CSVs (multiple):").grid(row=row, column=0, sticky="nw")
-
-        pec_frame = ttk.Frame(frm)
-        pec_frame.grid(row=row, column=1, columnspan=2, sticky="nsew")
-
-        self.pec_list = tk.Listbox(pec_frame, height=7, selectmode="extended")
-        self.pec_list.grid(row=0, column=0, sticky="nsew")
-        pec_scroll = ttk.Scrollbar(pec_frame, orient="vertical", command=self.pec_list.yview)
-        pec_scroll.grid(row=0, column=1, sticky="ns")
-        self.pec_list.configure(yscrollcommand=pec_scroll.set)
-
-        btns = ttk.Frame(pec_frame)
-        btns.grid(row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
-
-        ttk.Button(btns, text="Add PEC files...", command=self.add_pec_files).pack(side="left")
-        ttk.Button(btns, text="Remove selected", command=self.remove_selected_pec).pack(side="left", padx=(8, 0))
-        ttk.Button(btns, text="Clear", command=self.clear_pec).pack(side="left", padx=(8, 0))
-
-        pec_frame.columnconfigure(0, weight=1)
-        pec_frame.rowconfigure(0, weight=1)
-
-        row += 1
-        ttk.Label(frm, text="Output CSV:").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.out_var, width=100).grid(row=row, column=1, sticky="we")
-        ttk.Button(frm, text="Save As...", command=self.pick_out).grid(row=row, column=2, sticky="e")
-
-        row += 1
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=3, sticky="we", pady=10)
-
-        row += 1
-        opt = ttk.Frame(frm)
-        opt.grid(row=row, column=0, columnspan=3, sticky="we")
-
         self.tol_var = tk.StringVar(value="0.5")
         self.dir_var = tk.StringVar(value="nearest")
 
+        r = 0
+        ttk.Label(root, text="NI DAQ CSV:").grid(row=r, column=0, sticky="w")
+        ttk.Entry(root, textvariable=self.ni_var, width=110).grid(row=r, column=1, sticky="we")
+        ttk.Button(root, text="Browse...", command=self.pick_ni).grid(row=r, column=2, sticky="e")
+
+        r += 1
+        ttk.Label(root, text="Output CSV:").grid(row=r, column=0, sticky="w")
+        ttk.Entry(root, textvariable=self.out_var, width=110).grid(row=r, column=1, sticky="we")
+        ttk.Button(root, text="Save As...", command=self.pick_out).grid(row=r, column=2, sticky="e")
+
+        r += 1
+        ttk.Separator(root).grid(row=r, column=0, columnspan=3, sticky="we", pady=10)
+
+        r += 1
+        opt = ttk.Frame(root)
+        opt.grid(row=r, column=0, columnspan=3, sticky="we")
         ttk.Label(opt, text="Tolerance (seconds):").grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Entry(opt, textvariable=self.tol_var, width=10).grid(row=0, column=1, sticky="w", padx=(0, 18))
-
         ttk.Label(opt, text="Merge direction:").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        ttk.Combobox(
-            opt,
-            textvariable=self.dir_var,
-            values=["nearest", "backward", "forward"],
-            width=10,
-            state="readonly",
-        ).grid(row=0, column=3, sticky="w", padx=(0, 18))
+        ttk.Combobox(opt, textvariable=self.dir_var, values=["nearest", "backward", "forward"], width=10, state="readonly")\
+            .grid(row=0, column=3, sticky="w", padx=(0, 18))
+        ttk.Label(opt, text=f"NI time column detection: contains '{NI_TIME_SUBSTRING}'").grid(row=0, column=4, sticky="w")
 
-        ttk.Label(opt, text=f"NI time column detection: contains '{NI_TIME_SUBSTRING}'").grid(
-            row=0, column=4, sticky="w"
-        )
+        r += 1
+        ttk.Separator(root).grid(row=r, column=0, columnspan=3, sticky="we", pady=10)
 
-        row += 1
-        self.run_btn = ttk.Button(frm, text="Merge and Save", command=self.run_merge)
-        self.run_btn.grid(row=row, column=0, sticky="w", pady=(10, 0))
+        r += 1
+        header = ttk.Frame(root)
+        header.grid(row=r, column=0, columnspan=3, sticky="we")
+        ttk.Label(header, text="Batteries:").pack(side="left")
+        ttk.Button(header, text="Add Battery...", command=self.add_battery).pack(side="right")
 
-        self.progress = ttk.Progressbar(frm, mode="indeterminate")
-        self.progress.grid(row=row, column=1, columnspan=2, sticky="we", pady=(10, 0), padx=(10, 0))
+        r += 1
+        self.canvas = tk.Canvas(root, highlightthickness=0)
+        self.canvas.grid(row=r, column=0, columnspan=3, sticky="nsew")
+        sb = ttk.Scrollbar(root, orient="vertical", command=self.canvas.yview)
+        sb.grid(row=r, column=3, sticky="ns")
+        self.canvas.configure(yscrollcommand=sb.set)
 
-        row += 1
-        ttk.Label(frm, text="Log:").grid(row=row, column=0, sticky="nw", pady=(10, 0))
+        self.container = ttk.Frame(self.canvas)
+        self.container_win = self.canvas.create_window((0, 0), window=self.container, anchor="nw")
 
-        self.log = tk.Text(frm, height=10, wrap="word")
-        self.log.grid(row=row, column=1, columnspan=2, sticky="nsew", pady=(10, 0))
+        def _on_container_configure(_evt):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
-        frm.columnconfigure(1, weight=1)
-        frm.rowconfigure(row, weight=1)
+        def _on_canvas_configure(evt):
+            self.canvas.itemconfigure(self.container_win, width=evt.width)
 
-        self._log("Select NI DAQ CSV, add 1+ PEC CSVs, choose output path, then click 'Merge and Save'.")
+        self.container.bind("<Configure>", _on_container_configure)
+        self.canvas.bind("<Configure>", _on_canvas_configure)
+
+        r += 1
+        actions = ttk.Frame(root)
+        actions.grid(row=r, column=0, columnspan=3, sticky="we", pady=(10, 0))
+        self.run_btn = ttk.Button(actions, text="Merge and Save", command=self.run_merge)
+        self.run_btn.pack(side="left")
+        self.progress = ttk.Progressbar(actions, mode="indeterminate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=(10, 0))
+
+        r += 1
+        ttk.Label(root, text="Log:").grid(row=r, column=0, sticky="nw", pady=(10, 0))
+        self.log = tk.Text(root, height=10, wrap="word")
+        self.log.grid(row=r, column=1, columnspan=2, sticky="nsew", pady=(10, 0))
+
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(5, weight=1)
+        root.rowconfigure(r, weight=1)
+
+        self.add_battery()
+        self._log("Fixed: no more row explosion with duplicate NI timestamps (joins use ni_row_id).")
 
     def _log(self, msg: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -322,43 +430,6 @@ class MergeApp(tk.Tk):
             self.ni_var.set(p)
             self._log(f"NI DAQ file: {p}")
 
-    def add_pec_files(self) -> None:
-        paths = filedialog.askopenfilenames(
-            title="Select one or more PEC Cycler CSV files",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-        if not paths:
-            return
-
-        existing = set(self.state_data.pec_paths)
-        added = 0
-        for p in paths:
-            if p not in existing:
-                self.state_data.pec_paths.append(p)  # FIX: append to the real list
-                self.pec_list.insert("end", p)
-                existing.add(p)
-                added += 1
-
-        self._log(f"Added {added} PEC file(s). Total PEC files: {len(self.state_data.pec_paths)}")
-
-    def remove_selected_pec(self) -> None:
-        sel = list(self.pec_list.curselection())
-        if not sel:
-            return
-        sel.reverse()
-        for idx in sel:
-            path = self.pec_list.get(idx)
-            self.pec_list.delete(idx)
-            if path in self.state_data.pec_paths:
-                self.state_data.pec_paths.remove(path)
-
-        self._log(f"Removed selected PEC file(s). Total PEC files: {len(self.state_data.pec_paths)}")
-
-    def clear_pec(self) -> None:
-        self.pec_list.delete(0, "end")
-        self.state_data.pec_paths.clear()
-        self._log("Cleared PEC file list.")
-
     def pick_out(self) -> None:
         p = filedialog.asksaveasfilename(
             title="Save merged CSV as",
@@ -369,59 +440,92 @@ class MergeApp(tk.Tk):
             self.out_var.set(p)
             self._log(f"Output will be saved to: {p}")
 
+    def add_battery(self) -> None:
+        b = BatterySelection(battery_id="0000")
+        self.state.batteries.append(b)
+        row = BatteryRow(self.container, app=self, battery=b)
+        row.pack(fill="x", expand=True, pady=(0, 10))
+        self.battery_rows.append(row)
+        self._log("Added battery section. Enter 4-digit ID and select PEC files.")
+
+    def remove_battery_row(self, row: BatteryRow) -> None:
+        if row not in self.battery_rows:
+            return
+        idx = self.battery_rows.index(row)
+        bid = row.id_var.get().strip()
+        self.battery_rows.pop(idx)
+        self.state.batteries.pop(idx)
+        row.destroy()
+        self._log(f"Removed battery section ({bid or 'unknown'}).")
+
     @staticmethod
     def _format_timedelta(td: pd.Timedelta) -> str:
-        total_seconds = abs(float(td.total_seconds()))
-        if total_seconds < 60:
-            return f"{total_seconds:.3f} s"
-        if total_seconds < 3600:
-            return f"{total_seconds/60:.3f} min"
-        return f"{total_seconds/3600:.3f} hr"
+        s = abs(float(td.total_seconds()))
+        if s < 60:
+            return f"{s:.3f} s"
+        if s < 3600:
+            return f"{s/60:.3f} min"
+        return f"{s/3600:.3f} hr"
 
-    def _check_overlaps_and_confirm(self, pec_paths: list[str]) -> bool:
-        self._log("Checking PEC file time ranges for overlap...")
+    def _validate_batteries(self) -> dict[str, list[str]] | None:
+        battery_map: dict[str, list[str]] = {}
+        seen: set[str] = set()
+
+        for row in self.battery_rows:
+            bid = row.id_var.get().strip()
+            if not re.fullmatch(r"\d{4}", bid):
+                messagebox.showerror("Invalid Battery ID", f"Battery ID must be exactly 4 digits. Got: {bid!r}")
+                return None
+            if bid in seen:
+                messagebox.showerror("Duplicate Battery ID", f"Battery ID {bid} is used more than once.")
+                return None
+            seen.add(bid)
+
+            if not row.battery.pec_paths:
+                messagebox.showerror("Missing PEC files", f"Please add at least one PEC CSV file for battery {bid}.")
+                return None
+
+            missing = [p for p in row.battery.pec_paths if not Path(p).exists()]
+            if missing:
+                messagebox.showerror(
+                    "Missing PEC files",
+                    f"Some PEC paths no longer exist for battery {bid}:\n" + "\n".join(missing),
+                )
+                return None
+
+            battery_map[bid] = list(row.battery.pec_paths)
+
+        return battery_map
+
+    def _check_overlaps_for_battery_and_confirm(self, battery_id: str, pec_paths: list[str]) -> bool:
+        self._log(f"Checking overlaps for battery {battery_id}...")
         bounds_df = compute_pec_bounds(pec_paths)
         overlaps = find_overlaps(bounds_df)
-
         if not overlaps:
-            self._log("No PEC overlaps detected.")
+            self._log(f"Battery {battery_id}: no overlaps detected.")
             return True
 
         lines = [
-            "WARNING: Overlapping PEC file time ranges detected.",
-            "",
-            "This can cause ambiguous matching when merging.",
+            f"WARNING: Overlapping PEC file time ranges detected for battery {battery_id}.",
             "",
             "Overlaps found:",
         ]
-
         for o in overlaps:
             lines.append(f"- {o.file_a} and {o.file_b}")
             lines.append(f"  {o.file_a} ends:   {o.a_end}")
             lines.append(f"  {o.file_b} starts: {o.b_start}")
             lines.append(f"  Overlap amount:    {self._format_timedelta(o.overlap)}")
             lines.append("")
+        lines.append("Do you want to continue anyway for this battery?")
 
-        lines.append("Do you want to continue anyway?")
-
-        msg = "\n".join(lines)
-        self._log("PEC overlap detected; asking user whether to continue.")
-        return messagebox.askyesno("PEC Overlap Warning", msg)
+        return messagebox.askyesno(f"PEC Overlap Warning (Battery {battery_id})", "\n".join(lines))
 
     def run_merge(self) -> None:
         ni_path = self.ni_var.get().strip()
-        pec_paths = list(self.state_data.pec_paths)  # real list now
         out_path = self.out_var.get().strip()
 
         if not ni_path or not Path(ni_path).exists():
             messagebox.showerror("Missing file", "Please select a valid NI DAQ CSV file.")
-            return
-        if not pec_paths:
-            messagebox.showerror("Missing PEC files", "Please add at least one PEC cycler CSV file.")
-            return
-        missing = [p for p in pec_paths if not Path(p).exists()]
-        if missing:
-            messagebox.showerror("Missing PEC files", "Some PEC paths no longer exist:\n" + "\n".join(missing))
             return
         if not out_path:
             messagebox.showerror("Missing output", "Please choose an output CSV path.")
@@ -440,31 +544,39 @@ class MergeApp(tk.Tk):
             messagebox.showerror("Invalid direction", "Direction must be one of: nearest, backward, forward.")
             return
 
-        try:
-            if not self._check_overlaps_and_confirm(pec_paths):
-                self._log("User cancelled due to PEC overlap warning.")
-                return
-        except Exception as e:
-            self._log(f"ERROR during overlap check: {e}")
-            messagebox.showerror("Overlap check failed", str(e))
+        battery_map = self._validate_batteries()
+        if battery_map is None:
             return
+
+        for bid, paths in battery_map.items():
+            try:
+                if not self._check_overlaps_for_battery_and_confirm(bid, paths):
+                    self._log(f"User cancelled merge due to overlap warning for battery {bid}.")
+                    return
+            except Exception as e:
+                self._log(f"ERROR during overlap check for battery {bid}: {e}")
+                messagebox.showerror("Overlap check failed", f"Battery {bid}: {e}")
+                return
 
         self.progress.start(10)
         self.run_btn.configure(state="disabled")
         self.update_idletasks()
 
         try:
-            self._log("Reading NI DAQ file and merging with PEC data...")
-            merged = merge_files(
+            self._log(f"Merging {len(battery_map)} battery(ies) onto NI timeline...")
+            merged = merge_multi_battery_wide(
                 ni_path=ni_path,
-                pec_paths=pec_paths,
+                battery_to_pec_paths=battery_map,
                 tolerance_seconds=tol,
                 direction=direction,
             )
 
-            matched = merged["pec_timestamp"].notna().sum()
-            total = len(merged)
-            self._log(f"Merged rows: {total}. Matched within tolerance: {matched} ({matched/total:.1%}).")
+            for bid in battery_map.keys():
+                ts_col = f"{bid}__pec_timestamp"
+                if ts_col in merged.columns:
+                    matched = merged[ts_col].notna().sum()
+                    total = len(merged)
+                    self._log(f"Battery {bid}: matched within tolerance: {matched}/{total} ({matched/total:.1%})")
 
             merged.to_csv(out_path, index=False)
             self._log(f"Saved merged CSV: {out_path}")
